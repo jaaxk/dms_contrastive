@@ -1,0 +1,7 @@
+dms_data/embeddings/*
+!dms_data/embeddings/.gitkeep
+dms_data/datasets/*
+!dms_data/datasets/.gitkeep
+logs/*
+results/*
+venv/*
