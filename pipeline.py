@@ -18,6 +18,8 @@ import seaborn as sns
 from sklearn.manifold import TSNE
 from sklearn.metrics import accuracy_score, precision_score, recall_score, f1_score, roc_auc_score
 from sklearn.model_selection import train_test_split
+from sklearn.cluster import KMeans
+from sklearn.linear_model import LogisticRegression
 import warnings
 from tqdm import tqdm
 import pickle
@@ -418,13 +420,15 @@ def create_train_test_split(df, split_by_gene=True, test_size=0.2):
 
     return train_df, test_df
 
-def train_epoch(projection_net, loss_fn, dataloader, optimizer, device):
+def train_epoch(projection_net, loss_fn, dataloader, optimizer, device, n_clusters=2):
     projection_net.train()
 
     total_loss = 0
-    all_predictions = []
+    all_similarities = []
     all_labels = []
     all_distances = []
+    all_projections = []
+    all_quartiles = []
     num_batches = 0
 
     for batch in dataloader:
@@ -435,6 +439,7 @@ def train_epoch(projection_net, loss_fn, dataloader, optimizer, device):
 
         #project embeddings
         projected = projection_net(embeddings)
+        all_projections.extend(projected.cpu().detach().numpy())
 
         #compute loss
         loss, similarities, distances, labels = loss_fn(projected, quartiles)
@@ -446,18 +451,22 @@ def train_epoch(projection_net, loss_fn, dataloader, optimizer, device):
         total_loss += loss.item()
         num_batches += 1
 
-        all_predictions.extend(similarities)
+        all_similarities.extend(similarities)
         all_distances.extend(distances)
         all_labels.extend(labels)
+        all_quartiles.extend(quartiles)
 
-    return total_loss / max(num_batches, 1), all_predictions, all_labels, all_distances
+    return total_loss / max(num_batches, 1), all_similarities, all_labels, all_distances, all_quartiles, all_projections
 
-def evaluate_model(projection_net, loss_fn, dataloader, device):
+def evaluate_model(projection_net, loss_fn, dataloader, device, n_clusters=2):
     projection_net.eval()
 
-    all_predictions = []
+    all_similarities = []
     all_labels = []
     all_distances = []
+    all_kmeans_labels = []
+    all_quartiles = []
+    all_projections = []
     total_loss = 0
     num_batches = 0
 
@@ -468,6 +477,7 @@ def evaluate_model(projection_net, loss_fn, dataloader, device):
 
             #project embeddings
             projected = projection_net(embeddings)
+            all_projections.extend(projected.cpu().detach().numpy())
 
             #compute loss
             loss, similarities, distances, labels = loss_fn(projected, quartiles)
@@ -475,12 +485,59 @@ def evaluate_model(projection_net, loss_fn, dataloader, device):
             total_loss += loss.item()
             num_batches += 1
 
-            all_predictions.extend(similarities)
+            all_similarities.extend(similarities)
             all_distances.extend(distances)
             all_labels.extend(labels)
+            all_quartiles.extend(quartiles)
 
     avg_loss = total_loss / max(num_batches, 1)
-    return avg_loss, all_predictions, all_labels, all_distances
+    return avg_loss, all_similarities, all_labels, all_distances, all_quartiles, all_projections
+
+def kmeans_metrics(projections, quartiles, n_clusters=2):
+    kmeans = KMeans(n_clusters=n_clusters, random_state=42)
+    kmeans.fit(projections)
+    kmeans_labels = kmeans.labels_
+
+    quartiles = [1 if q == 'high' else 0 for q in quartiles]
+
+    accuracy = max(accuracy_score(quartiles, kmeans_labels), 1 - accuracy_score(quartiles, kmeans_labels))
+    precision = max(precision_score(quartiles, kmeans_labels), 1 - precision_score(quartiles, kmeans_labels))
+    recall = max(recall_score(quartiles, kmeans_labels), 1 - recall_score(quartiles, kmeans_labels))
+    f1 = max(f1_score(quartiles, kmeans_labels), 1 - f1_score(quartiles, kmeans_labels))
+
+    return accuracy, precision, recall, f1
+
+def logreg_metrics(train_projections, train_quartiles, test_projections, test_quartiles, sample_train=1000):
+    # Sample data for efficiency
+    if len(train_projections) > sample_train:
+        train_indices = np.random.choice(len(train_projections), sample_train, replace=False)
+        train_proj_sample = [train_projections[i] for i in train_indices]
+        train_quartile_sample = [train_quartiles[i] for i in train_indices]
+    else:
+        train_proj_sample = train_projections
+        train_quartile_sample = train_quartiles
+    
+    # Convert to numpy arrays
+    X_train = np.array(train_proj_sample)
+    y_train = np.array([1 if q == 'high' else 0 for q in train_quartile_sample])
+    
+    X_test = np.array(test_projections)
+    y_test = np.array([1 if q == 'high' else 0 for q in test_quartiles])
+    
+    # Train logistic regression
+    clf = LogisticRegression(random_state=42)
+    clf.fit(X_train, y_train)
+    
+    # Predictions
+    y_pred = clf.predict(X_test)
+    
+    # Metrics
+    accuracy = accuracy_score(y_test, y_pred)
+    precision = precision_score(y_test, y_pred)
+    recall = recall_score(y_test, y_pred)
+    f1 = f1_score(y_test, y_pred)
+    
+    return accuracy, precision, recall, f1
 
 def plot_training_metrics(train_losses, val_losses, train_accs, val_accs):
     fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(15, 5))
@@ -569,19 +626,21 @@ def visualize_embeddings_tsne(embeddings, labels, title="t-SNE Visualization"):
 
 def main():
     print("="*80)
-    print("ESM Layer 11 + Stability + Cosine Similarity Contrastive Learning")
+    print(f"Running Contrastive Learning for {RUN_NAME}")
     print("="*80)
+    print(f"Embeddings Path: {EMBEDDINGS_PATH}")
+    print(f"Data Path: {DATA_PATH}")
     print(f"Device: {device}")
     print(f"Distance Metric: {DISTANCE_METRIC}")
     print(f"Learnable Transformation: {USE_LEARNABLE}")
     print(f"Output Normalization: {NORMALIZE_OUTPUT}")
     print("="*80)
 
-    try:
+    """try:
         from google.colab import drive
         drive.mount('/content/drive')
     except:
-        print("Not in Colab environment, skipping drive mount")
+        print("Not in Colab environment, skipping drive mount")"""
 
     #load embeddings
     seq_to_embedding = load_embeddings(EMBEDDINGS_PATH)
@@ -670,25 +729,25 @@ def main():
 
     for epoch in tqdm(range(NUM_EPOCHS), desc="Training Progress"):
         #train
-        train_loss, train_preds, train_labels_epoch, train_dists = train_epoch(
+        train_loss, train_similarities, train_labels_epoch, train_dists, train_quartiles, train_projections = train_epoch(
             projection_net, loss_fn, train_loader, optimizer, device
         )
 
         #eval
-        val_loss, val_preds, val_labels_epoch, val_dists = evaluate_model(
+        val_loss, val_similarities, val_labels_epoch, val_dists, val_quartiles, val_projections = evaluate_model(
             projection_net, loss_fn, test_loader, device
         )
 
         #metrics
-        train_preds_binary = [1 if p > 0.5 else 0 for p in train_preds]
-        val_preds_binary = [1 if p > 0.5 else 0 for p in val_preds]
+        
+        #train_acc, train_precision, train_recall, train_f1 = kmeans_metrics(train_projections, train_quartiles, n_clusters=2)
+        #val_acc, val_precision, val_recall, val_f1 = kmeans_metrics(val_projections, val_quartiles, n_clusters=2)
 
-        train_acc = accuracy_score(train_labels_epoch, train_preds_binary)
-        val_acc = accuracy_score(val_labels_epoch, val_preds_binary)
+        val_acc, val_precision, val_recall, val_f1 = logreg_metrics(train_projections, train_quartiles, val_projections, val_quartiles)
 
         train_losses.append(train_loss)
         val_losses.append(val_loss)
-        train_accs.append(train_acc)
+        #train_accs.append(train_acc)
         val_accs.append(val_acc)
 
         if val_loss < best_val_loss:
@@ -701,7 +760,7 @@ def main():
 
         if (epoch + 1) % 10 == 0:
             tqdm.write(f"Epoch {epoch+1}/{NUM_EPOCHS}")
-            tqdm.write(f"  Train Loss: {train_loss:.4f}, Train Acc: {train_acc:.4f}")
+            tqdm.write(f"  Train Loss: {train_loss:.4f}") #, Train Acc: {train_acc:.4f}")
             tqdm.write(f"  Val Loss: {val_loss:.4f}, Val Acc: {val_acc:.4f}")
             tqdm.write(f"  Patience: {patience_counter}/{PATIENCE}")
             if USE_LEARNABLE:
@@ -729,18 +788,14 @@ def main():
     plot_training_metrics(train_losses, val_losses, train_accs, val_accs)
 
     print("\n=== FINAL EVALUATION ===")
-    final_loss, final_preds, final_labels, final_dists = evaluate_model(
-        projection_net, loss_fn, test_loader, device
+    final_loss, final_similarities, final_labels, final_dists, final_quartiles, final_projections = evaluate_model(
+        projection_net, loss_fn, test_loader, device, n_clusters=2
     )
 
-    final_preds_binary = [1 if p > 0.5 else 0 for p in final_preds]
-
     test_loss = final_loss
-    test_acc = accuracy_score(final_labels, final_preds_binary)
-    test_precision = precision_score(final_labels, final_preds_binary)
-    test_recall = recall_score(final_labels, final_preds_binary)
-    test_f1 = f1_score(final_labels, final_preds_binary)
-    test_auc = roc_auc_score(final_labels, final_preds)
+    #test_acc, test_precision, test_recall, test_f1 = kmeans_metrics(final_projections, final_quartiles, n_clusters=2)
+    test_acc, test_precision, test_recall, test_f1 = logreg_metrics(train_projections, train_quartiles, final_projections, final_quartiles)
+    test_auc = roc_auc_score(final_labels, final_similarities) #auc based on similarities
 
     print(f"\nTest Metrics:")
     print(f"  Loss: {test_loss:.4f}")
@@ -791,7 +846,7 @@ def main():
             'best_val_loss': best_val_loss
         }
     }, f'{RESULTS_DIR}/{RUN_NAME}.pt')
-    print(" Model saved to 'esm_layer11_stability_cosine_model.pt'")
+    print(f" Model saved to '{RESULTS_DIR}/{RUN_NAME}.pt'")
 
 main()
 
