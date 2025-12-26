@@ -53,8 +53,9 @@ def parse_args():
     #data
     parser.add_argument('--embeddings_path', default='dms_data/embeddings/Stability/embeddings_layer11_mean.pkl')
     parser.add_argument('--data_path', default='dms_data/datasets/Stability.csv')
-    parser.add_argument('--split_by_gene', choices=[True, False], default=True)
+    parser.add_argument('--split_by_gene', choices=[True, False], default=True, help='train/test split by gene rather than variant')
     parser.add_argument('--base_results_dir', default='results')
+    parser.add_argument('--homologous_batch', action='store_true', help='each batch contains a single gene, no cross-gene pairs', default=False)
 
     args = parser.parse_args()
     return args
@@ -114,6 +115,7 @@ class DMSContrastiveDataset(Dataset):
             'gene': gene
         }
 
+
 class GeneAwareDataLoader:
     def __init__(self, dataset, batch_size=16, shuffle=True, balance_quartiles=True):
         self.dataset = dataset
@@ -121,6 +123,7 @@ class GeneAwareDataLoader:
         self.shuffle = shuffle
         self.balance_quartiles = balance_quartiles
 
+        print("Using homologous batch sampling - each batch will contain variants from the same gene")
         #group indices by gene and quartile
         self.gene_groups = {}
         for i, gene in enumerate(dataset.genes):
@@ -195,6 +198,64 @@ class GeneAwareDataLoader:
     def __len__(self):
         total_samples = len(self.dataset)
         return total_samples // self.batch_size
+
+class DataLoader():
+    def __init__(self, dataset, batch_size=16, shuffle=True, balance_quartiles=True):
+        self.dataset = dataset
+        self.batch_size = batch_size
+        self.shuffle = shuffle
+        self.balance_quartiles = balance_quartiles
+
+        print('Using basic data loader - no gene grouping')
+        
+        # Standard behavior - no gene grouping
+        self.indices = list(range(len(dataset)))
+        if self.shuffle:
+            np.random.shuffle(self.indices)
+
+    def __iter__(self):
+        # Separate indices by quartile
+        high_indices = [i for i, q in enumerate(self.dataset.quartiles) if q == 'high']
+        low_indices = [i for i, q in enumerate(self.dataset.quartiles) if q == 'low']
+        
+        if self.shuffle:
+            np.random.shuffle(high_indices)
+            np.random.shuffle(low_indices)
+        
+        # Determine the number of batches we can make
+        half_batch = self.batch_size // 2
+        num_batches = min(len(high_indices), len(low_indices)) // half_batch
+        
+        for i in range(num_batches):
+            # Take equal number of high and low quartile samples
+            batch_high = high_indices[i*half_batch:(i+1)*half_batch]
+            batch_low = low_indices[i*half_batch:(i+1)*half_batch]
+            batch_indices = batch_high + batch_low
+            
+            # Shuffle the combined batch
+            if self.shuffle:
+                np.random.shuffle(batch_indices)
+                
+            batch = [self.dataset[idx] for idx in batch_indices]
+            yield self._collate_batch(batch)
+
+    def _collate_batch(self, batch):
+        embeddings = torch.stack([item['embedding'] for item in batch])
+        quartiles = [item['quartile'] for item in batch]
+        dms_scores = [item['dms_score'] for item in batch]
+        sequences = [item['sequence'] for item in batch]
+        genes = [item['gene'] for item in batch]
+
+        return {
+            'embeddings': embeddings,
+            'quartiles': quartiles,
+            'dms_scores': dms_scores,
+            'sequences': sequences,
+            'genes': genes
+        }
+
+    def __len__(self):
+        return len(self.indices) // self.batch_size
 
 class ContrastiveNetwork(nn.Module):
     def __init__(self, input_dim=1280, hidden_dims=[512, 256, 128], normalize_output=False):
@@ -674,8 +735,12 @@ def main():
                                          seq_to_embedding, test_genes)
 
     #create data loaders
-    train_loader = GeneAwareDataLoader(train_dataset, batch_size=BATCH_SIZE, shuffle=True)
-    test_loader = GeneAwareDataLoader(test_dataset, batch_size=BATCH_SIZE, shuffle=False)
+    if args.homologous_batch:
+        train_loader = GeneAwareDataLoader(train_dataset, batch_size=BATCH_SIZE, shuffle=True)
+        test_loader = GeneAwareDataLoader(test_dataset, batch_size=BATCH_SIZE, shuffle=False)
+    else:
+        train_loader = DataLoader(train_dataset, batch_size=BATCH_SIZE, shuffle=True)
+        test_loader = DataLoader(test_dataset, batch_size=BATCH_SIZE, shuffle=False)
 
     print(f"\n Data loaders created")
     print(f"   Train batches: ~{len(train_loader)}")
