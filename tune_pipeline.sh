@@ -13,11 +13,11 @@ source /gpfs/scratch/jvaska/brandes_lab/venv/bin/activate
 BASE_DATA_PATH="/gpfs/scratch/jvaska/brandes_lab/dms_data"
 
 for COARSE_SELECTION_TYPE in "Stability" "Activity" "Binding" "Expression" "OrganismalFitness"; do
-    for EMBEDDING_LAYER in "layer11_mean" "layer22_mean" "layer33_mean" "layer33_cls"; do
+    for EMBEDDING_LAYER in "layer33_mean"; do
         echo "Running ${COARSE_SELECTION_TYPE} ${EMBEDDING_LAYER}"
 
         EMBEDDING_PATH="${BASE_DATA_PATH}/embeddings/${COARSE_SELECTION_TYPE}/embeddings_${EMBEDDING_LAYER}.pkl"
-        RUN_NAME="${COARSE_SELECTION_TYPE}_${EMBEDDING_LAYER}"
+        RUN_NAME="nonhomologous_batch_${COARSE_SELECTION_TYPE}_${EMBEDDING_LAYER}"
 
         python -u pipeline.py --run_name $RUN_NAME \
             --embeddings_path $EMBEDDING_PATH \

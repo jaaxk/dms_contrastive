@@ -85,7 +85,7 @@ os.makedirs(f'{RESULTS_DIR}/training_figs', exist_ok=True)
 RESULTS_FILE = f'{args.base_results_dir}/results.csv'
 if not os.path.exists(RESULTS_FILE):
     with open(RESULTS_FILE, 'w') as f:
-        f.write('run_name,test_loss,test_acc,test_precision,test_recall,test_f1,test_auc\n')
+        f.write('run_name,test_loss,test_acc,test_precision,test_recall,test_f1,test_auc, baseline_acc, baseline_f1\n')
 
 class DMSContrastiveDataset(Dataset):
     def __init__(self, sequences, quartiles, dms_scores, seq_to_embedding, genes):
@@ -869,8 +869,17 @@ def main():
     print(f"  Recall: {test_recall:.4f}")
     print(f"  F1: {test_f1:.4f}")
     print(f"  AUC: {test_auc:.4f}")
+    
+    original_acc, original_precision, original_recall, original_f1 = logreg_metrics(train_dataset.embeddings, train_dataset.quartiles, test_dataset.embeddings, test_dataset.quartiles)
+    
+    print(f"\nOriginal Dataset Metrics:")
+    print(f"  Accuracy: {original_acc:.4f}")
+    print(f"  Precision: {original_precision:.4f}")
+    print(f"  Recall: {original_recall:.4f}")
+    print(f"  F1: {original_f1:.4f}")
+
     with open(RESULTS_FILE, 'a') as f:
-        f.write(f'{RUN_NAME},{test_loss},{test_acc},{test_precision},{test_recall},{test_f1},{test_auc}\n')
+        f.write(f'{RUN_NAME},{test_loss},{test_acc},{test_precision},{test_recall},{test_f1},{test_auc},{original_acc},{original_f1}\n')
 
     print(f"\nDistance Statistics:")
     print(f"  Mean: {np.mean(final_dists):.4f}")
