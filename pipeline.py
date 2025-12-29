@@ -21,6 +21,7 @@ from sklearn.model_selection import train_test_split
 from sklearn.cluster import KMeans
 from sklearn.linear_model import LogisticRegression
 import warnings
+import esm
 from tqdm import tqdm
 import pickle
 import os
@@ -49,9 +50,10 @@ def parse_args():
     #model hyperparams
     parser.add_argument('--hidden_dims', type=list, default=[512, 256, 128])
     parser.add_argument('--normalize_output', type=bool, default=True)
+    parser.add_argument('--freeze_esm', action='store_true', default=False)
 
     #data
-    parser.add_argument('--embeddings_path', default='dms_data/embeddings/Stability/embeddings_layer11_mean.pkl')
+    #parser.add_argument('--embeddings_path', default='dms_data/embeddings/Stability/embeddings_layer11_mean.pkl')
     parser.add_argument('--data_path', default='dms_data/datasets/Stability.csv')
     parser.add_argument('--split_by_gene', choices=[True, False], default=True, help='train/test split by gene rather than variant')
     parser.add_argument('--base_results_dir', default='results')
@@ -62,7 +64,7 @@ def parse_args():
 
 args = parse_args()
 
-EMBEDDINGS_PATH = args.embeddings_path
+#EMBEDDINGS_PATH = args.embeddings_path
 DATA_PATH = args.data_path
 RUN_NAME = args.run_name
 
@@ -88,11 +90,11 @@ if not os.path.exists(RESULTS_FILE):
         f.write('run_name,test_loss,test_acc,test_precision,test_recall,test_f1,test_auc, baseline_acc, baseline_f1\n')
 
 class DMSContrastiveDataset(Dataset):
-    def __init__(self, sequences, quartiles, dms_scores, seq_to_embedding, genes):
+    def __init__(self, sequences, quartiles, dms_scores, genes):
         self.sequences = sequences
         self.quartiles = quartiles
         self.dms_scores = dms_scores
-        self.seq_to_embedding = seq_to_embedding
+        #self.seq_to_embedding = seq_to_embedding
         self.genes = genes
 
     def __len__(self):
@@ -105,10 +107,9 @@ class DMSContrastiveDataset(Dataset):
         gene = self.genes[idx]
 
         #get precomputed embedding
-        emb = self.seq_to_embedding[seq]
+        #emb = self.seq_to_embedding[seq]
 
         return {
-            'embedding': emb,
             'quartile': quartile,
             'dms_score': dms_score,
             'sequence': seq,
@@ -181,14 +182,13 @@ class GeneAwareDataLoader:
             yield self._collate_batch(batch)
 
     def _collate_batch(self, batch):
-        embeddings = torch.stack([item['embedding'] for item in batch])
+        #embeddings = torch.stack([item['embedding'] for item in batch])
         quartiles = [item['quartile'] for item in batch]
         dms_scores = [item['dms_score'] for item in batch]
         sequences = [item['sequence'] for item in batch]
         genes = [item['gene'] for item in batch]
 
         return {
-            'embeddings': embeddings,
             'quartiles': quartiles,
             'dms_scores': dms_scores,
             'sequences': sequences,
@@ -240,14 +240,13 @@ class DataLoader():
             yield self._collate_batch(batch)
 
     def _collate_batch(self, batch):
-        embeddings = torch.stack([item['embedding'] for item in batch])
+        #embeddings = torch.stack([item['embedding'] for item in batch])
         quartiles = [item['quartile'] for item in batch]
         dms_scores = [item['dms_score'] for item in batch]
         sequences = [item['sequence'] for item in batch]
         genes = [item['gene'] for item in batch]
 
         return {
-            'embeddings': embeddings,
             'quartiles': quartiles,
             'dms_scores': dms_scores,
             'sequences': sequences,
@@ -258,8 +257,10 @@ class DataLoader():
         return len(self.indices) // self.batch_size
 
 class ContrastiveNetwork(nn.Module):
-    def __init__(self, input_dim=1280, hidden_dims=[512, 256, 128], normalize_output=False):
+    def __init__(self, esm_model, input_dim=1280, hidden_dims=[512, 256, 128], normalize_output=False):
         super(ContrastiveNetwork, self).__init__()
+
+        self.esm = esm_model
 
         layers = []
         prev_dim = input_dim
@@ -276,8 +277,16 @@ class ContrastiveNetwork(nn.Module):
         self.projection = nn.Sequential(*layers)
         self.normalize_output = normalize_output
 
-    def forward(self, x):
-        x = self.projection(x)
+    def forward(self, tokens):
+        if args.freeze_esm:
+            with torch.no_grad():
+                out = self.esm(tokens, repr_layers=[33])  # Use the last layer
+        else:
+            out = self.esm(tokens, repr_layers=[33])  # Use the last layer
+
+        reps = out["representations"][33]
+        embs = reps.mean(dim=1) #mean pool
+        x = self.projection(embs)  # Use mean pooled representations
         if self.normalize_output:
             #l2 normalize
             x = nn.functional.normalize(x, p=2, dim=-1)
@@ -495,11 +504,11 @@ def train_epoch(projection_net, loss_fn, dataloader, optimizer, device, n_cluste
     for batch in dataloader:
         optimizer.zero_grad()
 
-        embeddings = batch['embeddings'].to(device)
+        sequences = batch['sequences'].to(device)
         quartiles = batch['quartiles']
 
         #project embeddings
-        projected = projection_net(embeddings)
+        projected = projection_net(sequences)
         all_projections.extend(projected.cpu().detach().numpy())
 
         #compute loss
@@ -533,11 +542,11 @@ def evaluate_model(projection_net, loss_fn, dataloader, device, n_clusters=2):
 
     with torch.no_grad():
         for batch in dataloader:
-            embeddings = batch['embeddings'].to(device)
+            sequences = batch['sequences'].to(device)
             quartiles = batch['quartiles']
 
             #project embeddings
-            projected = projection_net(embeddings)
+            projected = projection_net(sequences)
             all_projections.extend(projected.cpu().detach().numpy())
 
             #compute loss
@@ -689,7 +698,7 @@ def main():
     print("="*80)
     print(f"Running Contrastive Learning for {RUN_NAME}")
     print("="*80)
-    print(f"Embeddings Path: {EMBEDDINGS_PATH}")
+    #print(f"Embeddings Path: {EMBEDDINGS_PATH}")
     print(f"Data Path: {DATA_PATH}")
     print(f"Device: {device}")
     print(f"Distance Metric: {DISTANCE_METRIC}")
@@ -704,15 +713,15 @@ def main():
         print("Not in Colab environment, skipping drive mount")"""
 
     #load embeddings
-    seq_to_embedding = load_embeddings(EMBEDDINGS_PATH)
+    #seq_to_embedding = load_embeddings(EMBEDDINGS_PATH)
 
     #load and preprocess data
     df = load_and_preprocess_data(DATA_PATH)
 
     #filter to sequences that have embeddings
-    available_sequences = set(seq_to_embedding.keys())
-    df = df[df['mutated_sequence'].isin(available_sequences)]
-    print(f"\n Filtered to {len(df)} samples with available embeddings")
+    #available_sequences = set(seq_to_embedding.keys())
+    #df = df[df['mutated_sequence'].isin(available_sequences)]
+    #print(f"\n Filtered to {len(df)} samples with available embeddings")
 
     #create train/test split
     train_df, test_df = create_train_test_split(df, test_size=0.2)
@@ -730,9 +739,9 @@ def main():
 
     #create datasets
     train_dataset = DMSContrastiveDataset(train_seqs, train_quarts, train_dms,
-                                          seq_to_embedding, train_genes)
+                                          train_genes)
     test_dataset = DMSContrastiveDataset(test_seqs, test_quarts, test_dms,
-                                         seq_to_embedding, test_genes)
+                                         test_genes)
 
     #create data loaders
     if args.homologous_batch:
@@ -759,7 +768,10 @@ def main():
     print(f"   Unique genes in batch: {unique_genes} (should be 1 for gene-aware)")
 
     #init model
+    esm_model, alphabet = esm.pretrained.esm2_t33_650M_UR50D()
+    batch_converter = alphabet.get_batch_converter()
     projection_net = ContrastiveNetwork(
+        esm_model=esm_model,
         input_dim=1280,
         hidden_dims=HIDDEN_DIMS,
         normalize_output=NORMALIZE_OUTPUT
