@@ -51,9 +51,10 @@ def parse_args():
     parser.add_argument('--hidden_dims', type=list, default=[512, 256, 128])
     parser.add_argument('--normalize_output', type=bool, default=True)
     parser.add_argument('--freeze_esm', action='store_true', default=False)
+    parser.add_argument('--esm_layer', type=int, default=33)
 
     #data
-    #parser.add_argument('--embeddings_path', default='dms_data/embeddings/Stability/embeddings_layer11_mean.pkl')
+    parser.add_argument('--embeddings_path', default=None)
     parser.add_argument('--data_path', default='dms_data/datasets/Stability.csv')
     parser.add_argument('--split_by_gene', choices=[True, False], default=True, help='train/test split by gene rather than variant')
     parser.add_argument('--base_results_dir', default='results')
@@ -65,6 +66,7 @@ def parse_args():
 args = parse_args()
 
 #EMBEDDINGS_PATH = args.embeddings_path
+seq_to_embedding = {}
 DATA_PATH = args.data_path
 RUN_NAME = args.run_name
 
@@ -200,8 +202,9 @@ class GeneAwareDataLoader:
         return total_samples // self.batch_size
 
 class DataLoader():
-    def __init__(self, dataset, batch_size=16, shuffle=True, balance_quartiles=True):
+    def __init__(self, dataset, batch_converter, batch_size=16, shuffle=True, balance_quartiles=True):
         self.dataset = dataset
+        self.batch_converter = batch_converter
         self.batch_size = batch_size
         self.shuffle = shuffle
         self.balance_quartiles = balance_quartiles
@@ -246,10 +249,14 @@ class DataLoader():
         sequences = [item['sequence'] for item in batch]
         genes = [item['gene'] for item in batch]
 
+        data = [(i, sequence) for i, sequence in enumerate(sequences)]
+
+        batch_labels, batch_strs, batch_toks = self.batch_converter(data)
+
         return {
             'quartiles': quartiles,
             'dms_scores': dms_scores,
-            'sequences': sequences,
+            'sequences': batch_toks,
             'genes': genes
         }
 
@@ -257,10 +264,11 @@ class DataLoader():
         return len(self.indices) // self.batch_size
 
 class ContrastiveNetwork(nn.Module):
-    def __init__(self, esm_model, input_dim=1280, hidden_dims=[512, 256, 128], normalize_output=False):
+    def __init__(self, esm_model, input_dim=1280, hidden_dims=[512, 256, 128], normalize_output=False, esm_layer=33):
         super(ContrastiveNetwork, self).__init__()
 
         self.esm = esm_model
+        self.esm_layer = esm_layer
 
         layers = []
         prev_dim = input_dim
@@ -278,13 +286,18 @@ class ContrastiveNetwork(nn.Module):
         self.normalize_output = normalize_output
 
     def forward(self, tokens):
+        global seq_to_embedding
         if args.freeze_esm:
             with torch.no_grad():
-                out = self.esm(tokens, repr_layers=[33])  # Use the last layer
+                try:
+                    out = seq_to_embedding[tokens]
+                except KeyError:
+                    out = self.esm(tokens, repr_layers=[self.esm_layer])
+                    seq_to_embedding[tokens] = out
         else:
-            out = self.esm(tokens, repr_layers=[33])  # Use the last layer
+            out = self.esm(tokens, repr_layers=[self.esm_layer])
 
-        reps = out["representations"][33]
+        reps = out["representations"][self.esm_layer]
         embs = reps.mean(dim=1) #mean pool
         x = self.projection(embs)  # Use mean pooled representations
         if self.normalize_output:
@@ -366,7 +379,8 @@ def load_embeddings(embeddings_path):
     print(f"Loading embeddings from {embeddings_path}")
 
     if not os.path.exists(embeddings_path):
-        raise FileNotFoundError(f"Embeddings file not found: {embeddings_path}")
+        print(f"No embeddings found at {embeddings_path}, will generate embeddings during training")
+        return {}
 
     with open(embeddings_path, 'rb') as f:
         data = pickle.load(f)
@@ -381,6 +395,11 @@ def load_embeddings(embeddings_path):
     seq_to_embedding = {seq: emb for seq, emb in zip(sequences, embeddings)}
 
     return seq_to_embedding
+
+def save_embeddings(seq_to_embedding, embeddings_path):
+    print(f"Saving embeddings to {embeddings_path}")
+    with open(embeddings_path, 'wb') as f:
+        pickle.dump(seq_to_embedding, f)
 
 def load_and_preprocess_data(data_path):
     print(f"Loading data from {data_path}")
@@ -713,7 +732,14 @@ def main():
         print("Not in Colab environment, skipping drive mount")"""
 
     #load embeddings
-    #seq_to_embedding = load_embeddings(EMBEDDINGS_PATH)
+    global seq_to_embedding
+    if args.freeze_esm:
+        if args.embeddings_path is None:
+            raise ValueError("Embeddings path must be specified if freeze_esm is True")
+        seq_to_embedding = load_embeddings(args.embeddings_path)
+        print(f'Loaded {len(seq_to_embedding)} embeddings from {args.embeddings_path}')
+    else:
+        seq_to_embedding = None
 
     #load and preprocess data
     df = load_and_preprocess_data(DATA_PATH)
@@ -725,6 +751,10 @@ def main():
 
     #create train/test split
     train_df, test_df = create_train_test_split(df, test_size=0.2)
+
+    #init ESM model
+    esm_model, alphabet = esm.pretrained.esm2_t33_650M_UR50D()
+    batch_converter = alphabet.get_batch_converter()
 
     #extract data
     train_seqs = train_df['mutated_sequence'].tolist()
@@ -745,11 +775,11 @@ def main():
 
     #create data loaders
     if args.homologous_batch:
-        train_loader = GeneAwareDataLoader(train_dataset, batch_size=BATCH_SIZE, shuffle=True)
-        test_loader = GeneAwareDataLoader(test_dataset, batch_size=BATCH_SIZE, shuffle=False)
+        train_loader = GeneAwareDataLoader(train_dataset, batch_converter, batch_size=BATCH_SIZE, shuffle=True)
+        test_loader = GeneAwareDataLoader(test_dataset, batch_converter, batch_size=BATCH_SIZE, shuffle=False)
     else:
-        train_loader = DataLoader(train_dataset, batch_size=BATCH_SIZE, shuffle=True)
-        test_loader = DataLoader(test_dataset, batch_size=BATCH_SIZE, shuffle=False)
+        train_loader = DataLoader(train_dataset, batch_converter, batch_size=BATCH_SIZE, shuffle=True)
+        test_loader = DataLoader(test_dataset, batch_converter, batch_size=BATCH_SIZE, shuffle=False)
 
     print(f"\n Data loaders created")
     print(f"   Train batches: ~{len(train_loader)}")
@@ -768,13 +798,12 @@ def main():
     print(f"   Unique genes in batch: {unique_genes} (should be 1 for gene-aware)")
 
     #init model
-    esm_model, alphabet = esm.pretrained.esm2_t33_650M_UR50D()
-    batch_converter = alphabet.get_batch_converter()
     projection_net = ContrastiveNetwork(
         esm_model=esm_model,
         input_dim=1280,
         hidden_dims=HIDDEN_DIMS,
-        normalize_output=NORMALIZE_OUTPUT
+        normalize_output=NORMALIZE_OUTPUT,
+        esm_layer=args.esm_layer
     ).to(device)
 
     loss_fn = ContrastiveLoss(
@@ -814,6 +843,10 @@ def main():
         val_loss, val_similarities, val_labels_epoch, val_dists, val_quartiles, val_projections = evaluate_model(
             projection_net, loss_fn, test_loader, device
         )
+
+        #save embeddings
+        if args.freeze_esm:
+            save_embeddings(seq_to_embedding, args.embeddings_path)
 
         #metrics
         

@@ -6,11 +6,9 @@
 #SBATCH --output=logs/%j.out
 #SBATCH --job-name=dms_cl
 
-module load python/3.9.7
-module load cuda113
-source /gpfs/scratch/jvaska/brandes_lab/venv/bin/activate
+source venv/bin/activate
 
-BASE_DATA_PATH="/gpfs/scratch/jvaska/brandes_lab/dms_data"
+BASE_DATA_PATH="/Users/jackvaska/Desktop/Other/Jobs/NYU/brandes_lab/dms/dms_contrastive/dms_data"
 
 COARSE_SELECTION_TYPE="Stability"
 EMBEDDING_LAYER="layer33_mean"
@@ -22,4 +20,5 @@ RUN_NAME="ESM_TEST_${COARSE_SELECTION_TYPE}_${EMBEDDING_LAYER}"
 
 python -u pipeline.py --run_name $RUN_NAME \
     --data_path $BASE_DATA_PATH/datasets/${COARSE_SELECTION_TYPE}.csv \
-    --freeze_esm
+    --freeze_esm \
+    --embeddings_path $BASE_DATA_PATH/embeddings/${COARSE_SELECTION_TYPE}/embeddings_esm2_${EMBEDDING_LAYER}.pkl
