@@ -26,6 +26,8 @@ from tqdm import tqdm
 import pickle
 import os
 import argparse
+from transformers import AutoTokenizer, AutoModel
+
 warnings.filterwarnings('ignore')
 
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
@@ -52,13 +54,16 @@ def parse_args():
     parser.add_argument('--normalize_output', type=bool, default=True)
     parser.add_argument('--freeze_esm', action='store_true', default=False)
     parser.add_argument('--esm_layer', type=int, default=33)
+    parser.add_argument('--model_name', default='facebook/esm2_t33_650M_UR50D')
 
     #data
     parser.add_argument('--embeddings_path', default=None)
     parser.add_argument('--data_path', default='dms_data/datasets/Stability.csv')
     parser.add_argument('--split_by_gene', choices=[True, False], default=True, help='train/test split by gene rather than variant')
     parser.add_argument('--base_results_dir', default='results')
-    parser.add_argument('--homologous_batch', action='store_true', help='each batch contains a single gene, no cross-gene pairs', default=False)
+    parser.add_argument('--same_gene_batch', action='store_true', help='each batch contains a single gene, no cross-gene pairs', default=False)
+    parser.add_argument('--model_cache', default=None)
+    parser.add_argument('--esm_max_length', type=int, default=128)
 
     args = parser.parse_args()
     return args
@@ -82,6 +87,8 @@ USE_LEARNABLE = args.use_learnable
 HIDDEN_DIMS = args.hidden_dims
 NORMALIZE_OUTPUT = args.normalize_output
 
+if args.model_cache is not None:
+    torch.hub.set_dir(args.model_cache)
 #results dir
 RESULTS_DIR = f'{args.base_results_dir}/{args.run_name}'
 os.makedirs(RESULTS_DIR, exist_ok=True)
@@ -89,7 +96,11 @@ os.makedirs(f'{RESULTS_DIR}/training_figs', exist_ok=True)
 RESULTS_FILE = f'{args.base_results_dir}/results.csv'
 if not os.path.exists(RESULTS_FILE):
     with open(RESULTS_FILE, 'w') as f:
-        f.write('run_name,test_loss,test_acc,test_precision,test_recall,test_f1,test_auc, baseline_acc, baseline_f1\n')
+        f.write('run_name,test_loss,test_acc,test_precision,test_recall,test_f1,test_auc\n')
+
+#init ESM model
+esm_model = AutoModel.from_pretrained(args.model_name)
+tokenizer = AutoTokenizer.from_pretrained(args.model_name)
 
 class DMSContrastiveDataset(Dataset):
     def __init__(self, sequences, quartiles, dms_scores, genes):
@@ -103,7 +114,7 @@ class DMSContrastiveDataset(Dataset):
         return len(self.sequences)
 
     def __getitem__(self, idx):
-        seq = self.sequences[idx]
+        sequence = self.sequences[idx]
         quartile = self.quartiles[idx]
         dms_score = self.dms_scores[idx]
         gene = self.genes[idx]
@@ -114,7 +125,7 @@ class DMSContrastiveDataset(Dataset):
         return {
             'quartile': quartile,
             'dms_score': dms_score,
-            'sequence': seq,
+            'sequence': sequence,
             'gene': gene
         }
 
@@ -126,7 +137,7 @@ class GeneAwareDataLoader:
         self.shuffle = shuffle
         self.balance_quartiles = balance_quartiles
 
-        print("Using homologous batch sampling - each batch will contain variants from the same gene")
+        print("Using same gene batch sampling - each batch will contain variants from the same gene")
         #group indices by gene and quartile
         self.gene_groups = {}
         for i, gene in enumerate(dataset.genes):
@@ -202,9 +213,8 @@ class GeneAwareDataLoader:
         return total_samples // self.batch_size
 
 class DataLoader():
-    def __init__(self, dataset, batch_converter, batch_size=16, shuffle=True, balance_quartiles=True):
+    def __init__(self, dataset, batch_size=16, shuffle=True, balance_quartiles=True):
         self.dataset = dataset
-        self.batch_converter = batch_converter
         self.batch_size = batch_size
         self.shuffle = shuffle
         self.balance_quartiles = balance_quartiles
@@ -249,14 +259,11 @@ class DataLoader():
         sequences = [item['sequence'] for item in batch]
         genes = [item['gene'] for item in batch]
 
-        data = [(i, sequence) for i, sequence in enumerate(sequences)]
-
-        batch_labels, batch_strs, batch_toks = self.batch_converter(data)
 
         return {
             'quartiles': quartiles,
             'dms_scores': dms_scores,
-            'sequences': batch_toks,
+            'sequences': sequences,
             'genes': genes
         }
 
@@ -285,21 +292,17 @@ class ContrastiveNetwork(nn.Module):
         self.projection = nn.Sequential(*layers)
         self.normalize_output = normalize_output
 
-    def forward(self, tokens):
-        global seq_to_embedding
+    def forward(self, sequences):
+        #print('forward 1')
         if args.freeze_esm:
-            with torch.no_grad():
-                try:
-                    out = seq_to_embedding[tokens]
-                except KeyError:
-                    out = self.esm(tokens, repr_layers=[self.esm_layer])
-                    seq_to_embedding[tokens] = out
+            out = torch.stack([seq_to_embedding[seq] for seq in sequences]).to(device)
         else:
-            out = self.esm(tokens, repr_layers=[self.esm_layer])
+            raise NotImplementedError("need to imoplement this with HF transformers")
+            #out = self.esm(tokens, repr_layers=[self.esm_layer])
 
-        reps = out["representations"][self.esm_layer]
-        embs = reps.mean(dim=1) #mean pool
-        x = self.projection(embs)  # Use mean pooled representations
+        #reps = out["representations"][self.esm_layer]
+        #embs = reps.mean(dim=1) #mean pool
+        x = self.projection(out) 
         if self.normalize_output:
             #l2 normalize
             x = nn.functional.normalize(x, p=2, dim=-1)
@@ -383,21 +386,16 @@ def load_embeddings(embeddings_path):
         return {}
 
     with open(embeddings_path, 'rb') as f:
-        data = pickle.load(f)
+        seq_to_embedding = pickle.load(f)
 
-    embeddings = data['embeddings']
-    sequences = data['sequences']
-
-    print(f"Loaded {len(sequences)} embeddings")
-    print(f"Embedding shape: {embeddings[0].shape if len(embeddings) > 0 else 'N/A'}")
-
-    #sequence to embedding mapping
-    seq_to_embedding = {seq: emb for seq, emb in zip(sequences, embeddings)}
+    print(f"Loaded {len(seq_to_embedding)} embeddings")
+    if seq_to_embedding:
+        print(f"Embedding shape: {list(seq_to_embedding.values())[0].shape}")
 
     return seq_to_embedding
 
 def save_embeddings(seq_to_embedding, embeddings_path):
-    print(f"Saving embeddings to {embeddings_path}")
+    #print(f"Saving embeddings to {embeddings_path}")
     with open(embeddings_path, 'wb') as f:
         pickle.dump(seq_to_embedding, f)
 
@@ -509,7 +507,20 @@ def create_train_test_split(df, split_by_gene=True, test_size=0.2):
 
     return train_df, test_df
 
-def train_epoch(projection_net, loss_fn, dataloader, optimizer, device, n_clusters=2):
+def get_embeddings_from_model(projection_net, dataloader, device):
+    projection_net.eval()
+    
+    all_projections = []
+    
+    with torch.no_grad():
+        for batch in tqdm(dataloader):
+            sequences = batch['sequences'].to(device)
+            projected = projection_net(sequences)
+            all_projections.extend(projected.cpu().detach().numpy())
+    
+    return all_projections
+
+def train_epoch(projection_net, loss_fn, dataloader, optimizer, device):
     projection_net.train()
 
     total_loss = 0
@@ -523,7 +534,7 @@ def train_epoch(projection_net, loss_fn, dataloader, optimizer, device, n_cluste
     for batch in dataloader:
         optimizer.zero_grad()
 
-        sequences = batch['sequences'].to(device)
+        sequences = batch['sequences']
         quartiles = batch['quartiles']
 
         #project embeddings
@@ -547,7 +558,7 @@ def train_epoch(projection_net, loss_fn, dataloader, optimizer, device, n_cluste
 
     return total_loss / max(num_batches, 1), all_similarities, all_labels, all_distances, all_quartiles, all_projections
 
-def evaluate_model(projection_net, loss_fn, dataloader, device, n_clusters=2):
+def evaluate_model(projection_net, loss_fn, dataloader, device):
     projection_net.eval()
 
     all_similarities = []
@@ -561,7 +572,7 @@ def evaluate_model(projection_net, loss_fn, dataloader, device, n_clusters=2):
 
     with torch.no_grad():
         for batch in dataloader:
-            sequences = batch['sequences'].to(device)
+            sequences = batch['sequences']
             quartiles = batch['quartiles']
 
             #project embeddings
@@ -581,6 +592,14 @@ def evaluate_model(projection_net, loss_fn, dataloader, device, n_clusters=2):
 
     avg_loss = total_loss / max(num_batches, 1)
     return avg_loss, all_similarities, all_labels, all_distances, all_quartiles, all_projections
+
+def contrastive_metrics(similarities, labels):
+    binary_preds = [1 if sim > 0.5 else 0 for sim in similarities]
+    accuracy = accuracy_score(labels, binary_preds)
+    precision = precision_score(labels, binary_preds)
+    recall = recall_score(labels, binary_preds)
+    f1 = f1_score(labels, binary_preds)
+    return accuracy, precision, recall, f1
 
 def kmeans_metrics(projections, quartiles, n_clusters=2):
     kmeans = KMeans(n_clusters=n_clusters, random_state=42)
@@ -628,7 +647,7 @@ def logreg_metrics(train_projections, train_quartiles, test_projections, test_qu
     
     return accuracy, precision, recall, f1
 
-def plot_training_metrics(train_losses, val_losses, train_accs, val_accs):
+def plot_training_metrics(train_losses, val_losses, train_aucs, val_aucs):
     fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(15, 5))
 
     #loss plot
@@ -641,11 +660,11 @@ def plot_training_metrics(train_losses, val_losses, train_accs, val_accs):
     ax1.grid(True, alpha=0.3)
 
     #accuracy plot
-    ax2.plot(train_accs, label='Train Accuracy', color='blue')
-    ax2.plot(val_accs, label='Val Accuracy', color='red')
+    ax2.plot(train_aucs, label='Train AUC', color='blue')
+    ax2.plot(val_aucs, label='Val AUC', color='red')
     ax2.set_xlabel('Epoch')
-    ax2.set_ylabel('Accuracy')
-    ax2.set_title('Training and Validation Accuracy')
+    ax2.set_ylabel('AUC')
+    ax2.set_title('Training and Validation AUC')
     ax2.legend()
     ax2.grid(True, alpha=0.3)
 
@@ -713,6 +732,68 @@ def visualize_embeddings_tsne(embeddings, labels, title="t-SNE Visualization"):
     plt.tight_layout()
     plt.savefig(f'{RESULTS_DIR}/{title}.png')
 
+def extract_esm_embeddings(esm_model, sequences):
+    """Extract ESM embeddings for a list of sequences"""
+    print(f"Extracting ESM embeddings for {len(sequences)} sequences")
+    global seq_to_embedding
+    esm_model.eval()
+    
+    # Prepare batches
+    batches = []
+    for i in range(0, len(sequences), 100):
+        batch = sequences[i:i+100]
+        batches.append(batch)
+    
+    batch_idx=0
+    # Extract embeddings
+    for batch in tqdm(batches):
+        tokenized = tokenizer(batch, padding=True, truncation=True, max_length=args.esm_max_length, return_tensors="pt")
+        batch_tokens = tokenized['input_ids']
+        attention_mask = tokenized['attention_mask']
+
+        with torch.no_grad():
+            results = esm_model(input_ids=batch_tokens, attention_mask=attention_mask, output_hidden_states=True)
+            reps = results["hidden_states"][args.esm_layer]
+            #print(f'reps shape: {reps.shape()}')
+            
+            #mean pooling
+            mask = attention_mask.unsqueeze(-1)          # (B, L, 1)
+            masked_reps = reps * mask
+            sum_reps = masked_reps.sum(dim=1)
+            lengths = mask.sum(dim=1)
+
+            embeddings_batch = sum_reps / lengths         # (B, H)
+            embeddings_batch = embeddings_batch.cpu()
+
+            for seq, emb in zip(batch, embeddings_batch):
+                seq_to_embedding[seq] = emb
+
+            if batch_idx % 10 == 0:
+                save_embeddings(seq_to_embedding, args.embeddings_path)
+            batch_idx += 1
+    
+def get_missing_embeddings(seq_to_embedding, esm_model, sequences):
+    """Get embeddings for tokens that are not in the existing dictionary"""
+    print(f"Getting embeddings for {len(sequences)} sequences")
+
+    # Get sequences that don't have embeddings
+    missing_sequences = [seq for seq in sequences if seq not in seq_to_embedding.keys()]
+    print(f"Found {len(missing_sequences)} sequences without embeddings")
+    
+    if len(missing_sequences) == 0:
+        return seq_to_embedding
+    
+    # Extract embeddings for missing sequences
+    missing_embeddings = extract_esm_embeddings(esm_model, missing_sequences)
+    
+    # Add to existing dictionary
+    for seq, emb in zip(missing_sequences, missing_embeddings):
+        seq_to_embedding[seq] = emb
+    
+    print(f"Total embeddings now: {len(seq_to_embedding)}")
+    return seq_to_embedding
+
+
 def main():
     print("="*80)
     print(f"Running Contrastive Learning for {RUN_NAME}")
@@ -731,18 +812,9 @@ def main():
     except:
         print("Not in Colab environment, skipping drive mount")"""
 
-    #load embeddings
-    global seq_to_embedding
-    if args.freeze_esm:
-        if args.embeddings_path is None:
-            raise ValueError("Embeddings path must be specified if freeze_esm is True")
-        seq_to_embedding = load_embeddings(args.embeddings_path)
-        print(f'Loaded {len(seq_to_embedding)} embeddings from {args.embeddings_path}')
-    else:
-        seq_to_embedding = None
-
     #load and preprocess data
     df = load_and_preprocess_data(DATA_PATH)
+    #df = df.sample(600, random_state=42) #for testing
 
     #filter to sequences that have embeddings
     #available_sequences = set(seq_to_embedding.keys())
@@ -750,11 +822,7 @@ def main():
     #print(f"\n Filtered to {len(df)} samples with available embeddings")
 
     #create train/test split
-    train_df, test_df = create_train_test_split(df, test_size=0.2)
-
-    #init ESM model
-    esm_model, alphabet = esm.pretrained.esm2_t33_650M_UR50D()
-    batch_converter = alphabet.get_batch_converter()
+    train_df, test_df = create_train_test_split(df, split_by_gene=args.split_by_gene, test_size=0.2)
 
     #extract data
     train_seqs = train_df['mutated_sequence'].tolist()
@@ -767,6 +835,26 @@ def main():
     test_dms = test_df['DMS_score'].tolist()
     test_genes = test_df['filename'].tolist()
 
+    #print(f'train seq length distribution: {pd.Series(train_seqs).str.len().describe()}')
+    #print(f'test seq length distribution: {pd.Series(test_seqs).str.len().describe()}')
+
+    #tokenize
+    #print('Tokenizing...')
+    #train_tokens = tokenizer(train_seqs, padding='max_length', truncation=True, max_length=args.esm_max_length, return_tensors="pt")['input_ids']
+    #test_tokens = tokenizer(test_seqs, padding='max_length', truncation=True, max_length=args.esm_max_length, return_tensors="pt")['input_ids']
+
+    #load embeddings
+    global seq_to_embedding
+    if args.freeze_esm:
+        if args.embeddings_path is None:
+            raise ValueError("Embeddings path must be specified if freeze_esm is True")
+        seq_to_embedding = load_embeddings(args.embeddings_path)
+        print(f'Loaded {len(seq_to_embedding)} embeddings from {args.embeddings_path}')
+        seq_to_embedding = get_missing_embeddings(seq_to_embedding, esm_model, train_seqs + test_seqs)
+        save_embeddings(seq_to_embedding, args.embeddings_path)
+    else:
+        seq_to_embedding = None
+
     #create datasets
     train_dataset = DMSContrastiveDataset(train_seqs, train_quarts, train_dms,
                                           train_genes)
@@ -774,12 +862,12 @@ def main():
                                          test_genes)
 
     #create data loaders
-    if args.homologous_batch:
-        train_loader = GeneAwareDataLoader(train_dataset, batch_converter, batch_size=BATCH_SIZE, shuffle=True)
-        test_loader = GeneAwareDataLoader(test_dataset, batch_converter, batch_size=BATCH_SIZE, shuffle=False)
+    if args.same_gene_batch:
+        train_loader = GeneAwareDataLoader(train_dataset, batch_size=BATCH_SIZE, shuffle=True)
+        test_loader = GeneAwareDataLoader(test_dataset, batch_size=BATCH_SIZE, shuffle=False)
     else:
-        train_loader = DataLoader(train_dataset, batch_converter, batch_size=BATCH_SIZE, shuffle=True)
-        test_loader = DataLoader(test_dataset, batch_converter, batch_size=BATCH_SIZE, shuffle=False)
+        train_loader = DataLoader(train_dataset, batch_size=BATCH_SIZE, shuffle=True)
+        test_loader = DataLoader(test_dataset, batch_size=BATCH_SIZE, shuffle=False)
 
     print(f"\n Data loaders created")
     print(f"   Train batches: ~{len(train_loader)}")
@@ -824,6 +912,8 @@ def main():
     val_losses = []
     train_accs = []
     val_accs = []
+    train_aucs = []
+    val_aucs = []
 
     best_val_loss = float('inf')
     patience_counter = 0
@@ -844,21 +934,23 @@ def main():
             projection_net, loss_fn, test_loader, device
         )
 
-        #save embeddings
-        if args.freeze_esm:
-            save_embeddings(seq_to_embedding, args.embeddings_path)
-
         #metrics
         
         #train_acc, train_precision, train_recall, train_f1 = kmeans_metrics(train_projections, train_quartiles, n_clusters=2)
         #val_acc, val_precision, val_recall, val_f1 = kmeans_metrics(val_projections, val_quartiles, n_clusters=2)
+        #val_acc, val_precision, val_recall, val_f1 = logreg_metrics(train_projections, train_quartiles, val_projections, val_quartiles)
 
-        val_acc, val_precision, val_recall, val_f1 = logreg_metrics(train_projections, train_quartiles, val_projections, val_quartiles)
+        val_acc, val_precision, val_recall, val_f1 = contrastive_metrics(val_similarities, val_labels_epoch)
+        train_acc, train_precision, train_recall, train_f1 = contrastive_metrics(train_similarities, train_labels_epoch)
+        train_auc = roc_auc_score(train_labels_epoch, train_similarities)
+        val_auc = roc_auc_score(val_labels_epoch, val_similarities)
 
         train_losses.append(train_loss)
         val_losses.append(val_loss)
-        #train_accs.append(train_acc)
+        train_accs.append(train_acc)
         val_accs.append(val_acc)
+        train_aucs.append(train_auc)
+        val_aucs.append(val_auc)
 
         if val_loss < best_val_loss:
             best_val_loss = val_loss
@@ -895,16 +987,18 @@ def main():
     print("TRAINING COMPLETE")
     print("="*80 + "\n")
 
-    plot_training_metrics(train_losses, val_losses, train_accs, val_accs)
+    plot_training_metrics(train_losses, val_losses, train_aucs, val_aucs)
 
     print("\n=== FINAL EVALUATION ===")
     final_loss, final_similarities, final_labels, final_dists, final_quartiles, final_projections = evaluate_model(
-        projection_net, loss_fn, test_loader, device, n_clusters=2
+        projection_net, loss_fn, test_loader, device
     )
 
     test_loss = final_loss
     #test_acc, test_precision, test_recall, test_f1 = kmeans_metrics(final_projections, final_quartiles, n_clusters=2)
-    test_acc, test_precision, test_recall, test_f1 = logreg_metrics(train_projections, train_quartiles, final_projections, final_quartiles)
+    #test_acc, test_precision, test_recall, test_f1 = logreg_metrics(train_projections, train_quartiles, final_projections, final_quartiles)
+    test_acc, test_precision, test_recall, test_f1 = contrastive_metrics(final_similarities, final_labels)
+
     test_auc = roc_auc_score(final_labels, final_similarities) #auc based on similarities
 
     print(f"\nTest Metrics:")
@@ -915,16 +1009,16 @@ def main():
     print(f"  F1: {test_f1:.4f}")
     print(f"  AUC: {test_auc:.4f}")
     
-    original_acc, original_precision, original_recall, original_f1 = logreg_metrics(train_dataset.embeddings, train_dataset.quartiles, test_dataset.embeddings, test_dataset.quartiles)
+    #original_acc, original_precision, original_recall, original_f1 = logreg_metrics(train_dataset.embeddings, train_dataset.quartiles, test_dataset.embeddings, test_dataset.quartiles)
     
-    print(f"\nOriginal Dataset Metrics:")
-    print(f"  Accuracy: {original_acc:.4f}")
-    print(f"  Precision: {original_precision:.4f}")
-    print(f"  Recall: {original_recall:.4f}")
-    print(f"  F1: {original_f1:.4f}")
+    #print(f"\nOriginal Dataset Metrics:")
+    #print(f"  Accuracy: {original_acc:.4f}")
+    #print(f"  Precision: {original_precision:.4f}")
+    #print(f"  Recall: {original_recall:.4f}")
+    #print(f"  F1: {original_f1:.4f}")
 
     with open(RESULTS_FILE, 'a') as f:
-        f.write(f'{RUN_NAME},{test_loss},{test_acc},{test_precision},{test_recall},{test_f1},{test_auc},{original_acc},{original_f1}\n')
+        f.write(f'{RUN_NAME},{test_loss},{test_acc},{test_precision},{test_recall},{test_f1},{test_auc}\n')
 
     print(f"\nDistance Statistics:")
     print(f"  Mean: {np.mean(final_dists):.4f}")
@@ -944,10 +1038,10 @@ def main():
     sample_embeddings = torch.stack([seq_to_embedding[seq] for seq in sample_seqs])
 
     visualize_embeddings_tsne(sample_embeddings, sample_dms,
-                              "Original ESM Layer 11 Embeddings (DMS Colored)")
+                              f"Original ESM Layer {args.embedding_layer} Embeddings (DMS Colored)")
 
     with torch.no_grad():
-        projected_embeddings = projection_net(sample_embeddings.to(device))
+        projected_embeddings = projection_net(sample_seqs)
 
     visualize_embeddings_tsne(projected_embeddings, sample_dms,
                               "Projected Embeddings (DMS Colored)")
