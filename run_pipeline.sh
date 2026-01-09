@@ -1,8 +1,8 @@
 #!/bin/bash
-#SBATCH -p p100
+#SBATCH -p v100
 #SBATCH --gres=gpu:1
-#SBATCH --time=24:00:00
-#SBATCH --mem=62G
+#SBATCH --time=8:00:00
+#SBATCH --mem=120G
 #SBATCH --output=logs/%j.out
 #SBATCH --job-name=dms_cl
 
@@ -10,16 +10,23 @@ source venv/bin/activate
 
 BASE_DATA_PATH="/gpfs/scratch/jvaska/brandes_lab/dms_data"
 
-COARSE_SELECTION_TYPE="Stability"
 EMBEDDING_LAYER="layer33_mean"
 
-echo "Running ${COARSE_SELECTION_TYPE} ${EMBEDDING_LAYER}"
+for COARSE_SELECTION_TYPE in "Stability" "Binding" "OrganismalFitness" "Expression" "Activity"; do
+    echo "Running ${COARSE_SELECTION_TYPE} ${EMBEDDING_LAYER}"
 
-#EMBEDDING_PATH="${BASE_DATA_PATH}/embeddings/${COARSE_SELECTION_TYPE}/embeddings_${EMBEDDING_LAYER}.pkl"
-RUN_NAME="V3_TEST_${COARSE_SELECTION_TYPE}_${EMBEDDING_LAYER}"
+    RUN_NAME="V3_t6_8m_${COARSE_SELECTION_TYPE}_${EMBEDDING_LAYER}"
 
-python -u pipeline.py --run_name $RUN_NAME \
-    --data_path $BASE_DATA_PATH/datasets/${COARSE_SELECTION_TYPE}.csv \
-    --freeze_esm \
-    --embeddings_path $BASE_DATA_PATH/embeddings/${COARSE_SELECTION_TYPE}/embeddings_esm2_${EMBEDDING_LAYER}.pkl \
-    --model_cache /gpfs/scratch/jvaska/cache/esm
+    python -u pipeline.py --run_name $RUN_NAME \
+        --data_path $BASE_DATA_PATH/datasets/${COARSE_SELECTION_TYPE}.csv \
+        --embeddings_path $BASE_DATA_PATH/embeddings/${COARSE_SELECTION_TYPE}/test_embeddings_esm2_${EMBEDDING_LAYER}_mean.pkl \
+        --model_cache /gpfs/scratch/jvaska/cache/esm \
+        --model_name facebook/esm2_t30_150M_UR50D \
+        --esm_max_length 600 \
+        --input_dim 640 \
+        --batch_size 128 \
+        --patience 5 \
+        --normalize_to_wt \
+        --metadata_path $BASE_DATA_PATH/datasets/DMS_substitutions.csv
+
+done

@@ -63,7 +63,11 @@ def parse_args():
     parser.add_argument('--base_results_dir', default='results')
     parser.add_argument('--same_gene_batch', action='store_true', help='each batch contains a single gene, no cross-gene pairs', default=False)
     parser.add_argument('--model_cache', default=None)
-    parser.add_argument('--esm_max_length', type=int, default=128)
+    parser.add_argument('--esm_max_length', type=int, default=75)
+    parser.add_argument('--input_dim', type=int, default=1280)
+    parser.add_argument('--dropout', type=float, default=0.1)
+    parser.add_argument('--metadata_path', default=None)
+    parser.add_argument('--normalize_to_wt', action='store_true', default=False)
 
     args = parser.parse_args()
     return args
@@ -98,9 +102,34 @@ if not os.path.exists(RESULTS_FILE):
     with open(RESULTS_FILE, 'w') as f:
         f.write('run_name,test_loss,test_acc,test_precision,test_recall,test_f1,test_auc\n')
 
+if args.normalize_to_wt:
+    if not args.metadata_path:
+        raise ValueError("--metadata_path must be specified if --normalize_to_wt is set")
+    
+
 #init ESM model
 esm_model = AutoModel.from_pretrained(args.model_name)
 tokenizer = AutoTokenizer.from_pretrained(args.model_name)
+
+esm_model.eval() #REMOVE once we are finetuning
+esm_model.to(device)
+
+# Set all random seeds for reproducibility
+def set_seed(seed=42):
+    import random
+    import numpy as np
+    import torch
+    import os
+    
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
+    os.environ['PYTHONHASHSEED'] = str(seed)
+
+set_seed(42)  # Call this at the start of your script
 
 class DMSContrastiveDataset(Dataset):
     def __init__(self, sequences, quartiles, dms_scores, genes):
@@ -126,7 +155,7 @@ class DMSContrastiveDataset(Dataset):
             'quartile': quartile,
             'dms_score': dms_score,
             'sequence': sequence,
-            'gene': gene
+            'gene': gene,
         }
 
 
@@ -213,11 +242,12 @@ class GeneAwareDataLoader:
         return total_samples // self.batch_size
 
 class DataLoader():
-    def __init__(self, dataset, batch_size=16, shuffle=True, balance_quartiles=True):
+    def __init__(self, dataset, batch_size=16, shuffle=True, balance_quartiles=True, gene_to_wt=None):
         self.dataset = dataset
         self.batch_size = batch_size
         self.shuffle = shuffle
         self.balance_quartiles = balance_quartiles
+        self.gene_to_wt = gene_to_wt
 
         print('Using basic data loader - no gene grouping')
         
@@ -259,12 +289,15 @@ class DataLoader():
         sequences = [item['sequence'] for item in batch]
         genes = [item['gene'] for item in batch]
 
+        if self.gene_to_wt is not None:
+            wt_sequences = [self.gene_to_wt[gene] for gene in genes]
 
         return {
             'quartiles': quartiles,
             'dms_scores': dms_scores,
             'sequences': sequences,
-            'genes': genes
+            'genes': genes,
+            'wt_sequences': wt_sequences
         }
 
     def __len__(self):
@@ -274,11 +307,16 @@ class ContrastiveNetwork(nn.Module):
     def __init__(self, esm_model, input_dim=1280, hidden_dims=[512, 256, 128], normalize_output=False, esm_layer=33):
         super(ContrastiveNetwork, self).__init__()
 
+        if esm_layer != 33:
+            raise ValueError('change forward method to output all hidden states')
+
         self.esm = esm_model
         self.esm_layer = esm_layer
 
         layers = []
         prev_dim = input_dim
+
+        layers.append(nn.Dropout(args.dropout))
 
         for i, hidden_dim in enumerate(hidden_dims):
             layers.append(nn.Linear(prev_dim, hidden_dim))
@@ -292,13 +330,36 @@ class ContrastiveNetwork(nn.Module):
         self.projection = nn.Sequential(*layers)
         self.normalize_output = normalize_output
 
-    def forward(self, sequences):
+    def forward(self, batch):
         #print('forward 1')
         if args.freeze_esm:
-            out = torch.stack([seq_to_embedding[seq] for seq in sequences]).to(device)
+            out = torch.stack([seq_to_embedding[seq] for seq in batch['sequences']]).to(device)
         else:
-            raise NotImplementedError("need to imoplement this with HF transformers")
-            #out = self.esm(tokens, repr_layers=[self.esm_layer])
+            tokenized = tokenizer(batch['sequences'], padding=True, truncation=True, max_length=args.esm_max_length, return_tensors="pt")
+            batch_tokens = tokenized['input_ids'].to(device)
+            attention_mask = tokenized['attention_mask'].to(device)
+            with torch.no_grad(): #remove this once we're ready to finetune
+                results = esm_model(input_ids=batch_tokens, attention_mask=attention_mask, output_hidden_states=False)
+            reps = results["last_hidden_state"].to(device)
+            if args.normalize_to_wt:
+                tokenized = tokenizer(batch['wt_sequences'], padding=True, truncation=True, max_length=args.esm_max_length, return_tensors="pt")
+                batch_tokens = tokenized['input_ids'].to(device)
+                attention_mask = tokenized['attention_mask'].to(device)
+                with torch.no_grad(): #remove this once we're ready to finetune
+                    results = esm_model(input_ids=batch_tokens, attention_mask=attention_mask, output_hidden_states=False)
+                wt_reps = results["last_hidden_state"].to(device)
+
+                reps = reps - wt_reps
+            #print(f'reps shape: {reps.shape()}')
+            
+            #mean pooling
+            mask = attention_mask.unsqueeze(-1)          # (B, L, 1)
+            masked_reps = reps * mask
+            sum_reps = masked_reps.sum(dim=1)
+            lengths = mask.sum(dim=1)
+
+            embeddings_batch = sum_reps / lengths         # (B, H)
+            out = embeddings_batch
 
         #reps = out["representations"][self.esm_layer]
         #embs = reps.mean(dim=1) #mean pool
@@ -396,8 +457,10 @@ def load_embeddings(embeddings_path):
 
 def save_embeddings(seq_to_embedding, embeddings_path):
     #print(f"Saving embeddings to {embeddings_path}")
-    with open(embeddings_path, 'wb') as f:
+    tmp_path = args.embeddings_path + ".tmp"
+    with open(tmp_path, "wb") as f:
         pickle.dump(seq_to_embedding, f)
+    os.replace(tmp_path, args.embeddings_path)  # atomic move
 
 def load_and_preprocess_data(data_path):
     print(f"Loading data from {data_path}")
@@ -531,14 +594,14 @@ def train_epoch(projection_net, loss_fn, dataloader, optimizer, device):
     all_quartiles = []
     num_batches = 0
 
-    for batch in dataloader:
+    for batch in tqdm(dataloader, desc="Training"):
         optimizer.zero_grad()
 
-        sequences = batch['sequences']
+        #sequences = batch['sequences']
         quartiles = batch['quartiles']
 
         #project embeddings
-        projected = projection_net(sequences)
+        projected = projection_net(batch)
         all_projections.extend(projected.cpu().detach().numpy())
 
         #compute loss
@@ -571,7 +634,7 @@ def evaluate_model(projection_net, loss_fn, dataloader, device):
     num_batches = 0
 
     with torch.no_grad():
-        for batch in dataloader:
+        for batch in tqdm(dataloader, desc="Evaluation"):
             sequences = batch['sequences']
             quartiles = batch['quartiles']
 
@@ -754,6 +817,8 @@ def extract_esm_embeddings(esm_model, sequences):
         with torch.no_grad():
             results = esm_model(input_ids=batch_tokens, attention_mask=attention_mask, output_hidden_states=True)
             reps = results["hidden_states"][args.esm_layer]
+            print(f"Number of layers: {len(esm_model.encoder.layer)}")  # Should be 33
+            print(f"Hidden states shape: {len(results['hidden_states'])}")  # Should be 34 (33 layers + input embeddings)
             #print(f'reps shape: {reps.shape()}')
             
             #mean pooling
@@ -771,6 +836,9 @@ def extract_esm_embeddings(esm_model, sequences):
             if batch_idx % 10 == 0:
                 save_embeddings(seq_to_embedding, args.embeddings_path)
             batch_idx += 1
+
+    save_embeddings(seq_to_embedding, args.embeddings_path)
+    return seq_to_embedding
     
 def get_missing_embeddings(seq_to_embedding, esm_model, sequences):
     """Get embeddings for tokens that are not in the existing dictionary"""
@@ -784,11 +852,7 @@ def get_missing_embeddings(seq_to_embedding, esm_model, sequences):
         return seq_to_embedding
     
     # Extract embeddings for missing sequences
-    missing_embeddings = extract_esm_embeddings(esm_model, missing_sequences)
-    
-    # Add to existing dictionary
-    for seq, emb in zip(missing_sequences, missing_embeddings):
-        seq_to_embedding[seq] = emb
+    seq_to_embedding = extract_esm_embeddings(esm_model, missing_sequences)
     
     print(f"Total embeddings now: {len(seq_to_embedding)}")
     return seq_to_embedding
@@ -814,7 +878,19 @@ def main():
 
     #load and preprocess data
     df = load_and_preprocess_data(DATA_PATH)
-    #df = df.sample(600, random_state=42) #for testing
+    print(f'Initial mutated sequence length distribution: {df["mutated_sequence"].str.len().describe()}')
+    initial_length = len(df)
+    df = df[df['mutated_sequence'].str.len() <= args.esm_max_length]
+    filtered_count = initial_length - len(df)
+    if filtered_count > 0:
+        print(f"Filtered {filtered_count} sequences with length > {args.esm_max_length}")
+    #df = df.sample(100, random_state=42) #for testing
+
+    if args.normalize_to_wt:
+        gene_to_wt = pd.read_csv(args.metadata_path)
+        gene_to_wt = gene_to_wt.set_index('DMS_filename')['target_seq'].to_dict()
+    else:
+        gene_to_wt = None
 
     #filter to sequences that have embeddings
     #available_sequences = set(seq_to_embedding.keys())
@@ -866,8 +942,8 @@ def main():
         train_loader = GeneAwareDataLoader(train_dataset, batch_size=BATCH_SIZE, shuffle=True)
         test_loader = GeneAwareDataLoader(test_dataset, batch_size=BATCH_SIZE, shuffle=False)
     else:
-        train_loader = DataLoader(train_dataset, batch_size=BATCH_SIZE, shuffle=True)
-        test_loader = DataLoader(test_dataset, batch_size=BATCH_SIZE, shuffle=False)
+        train_loader = DataLoader(train_dataset, batch_size=BATCH_SIZE, shuffle=True, gene_to_wt=gene_to_wt)
+        test_loader = DataLoader(test_dataset, batch_size=BATCH_SIZE, shuffle=False, gene_to_wt=gene_to_wt)
 
     print(f"\n Data loaders created")
     print(f"   Train batches: ~{len(train_loader)}")
@@ -888,7 +964,7 @@ def main():
     #init model
     projection_net = ContrastiveNetwork(
         esm_model=esm_model,
-        input_dim=1280,
+        input_dim=args.input_dim,
         hidden_dims=HIDDEN_DIMS,
         normalize_output=NORMALIZE_OUTPUT,
         esm_layer=args.esm_layer
@@ -916,6 +992,7 @@ def main():
     val_aucs = []
 
     best_val_loss = float('inf')
+    best_val_auc = float('-inf')
     patience_counter = 0
     best_model_state = None
     
@@ -923,7 +1000,8 @@ def main():
     print("STARTING TRAINING")
     print(f"{'='*80}\n")
 
-    for epoch in tqdm(range(NUM_EPOCHS), desc="Training Progress"):
+    for epoch in range(NUM_EPOCHS):
+        print(f"\nEpoch {epoch+1}/{NUM_EPOCHS}")
         #train
         train_loss, train_similarities, train_labels_epoch, train_dists, train_quartiles, train_projections = train_epoch(
             projection_net, loss_fn, train_loader, optimizer, device
@@ -952,31 +1030,32 @@ def main():
         train_aucs.append(train_auc)
         val_aucs.append(val_auc)
 
-        if val_loss < best_val_loss:
-            best_val_loss = val_loss
+        if val_auc > best_val_auc:
+            best_val_auc = val_auc
             patience_counter = 0
             best_model_state = projection_net.state_dict().copy()
-            tqdm.write(f" Epoch {epoch+1}: New best val loss: {best_val_loss:.4f}")
+            print(f" Epoch {epoch+1}: New best val auc: {best_val_auc:.4f}")
         else:
             patience_counter += 1
 
-        if (epoch + 1) % 10 == 0:
-            tqdm.write(f"Epoch {epoch+1}/{NUM_EPOCHS}")
-            tqdm.write(f"  Train Loss: {train_loss:.4f}") #, Train Acc: {train_acc:.4f}")
-            tqdm.write(f"  Val Loss: {val_loss:.4f}, Val Acc: {val_acc:.4f}")
-            tqdm.write(f"  Patience: {patience_counter}/{PATIENCE}")
-            if USE_LEARNABLE:
-                tqdm.write(f"  Alpha: {loss_fn.alpha.item():.4f}, Beta: {loss_fn.beta.item():.4f}")
+        #if (epoch + 1) % 5 == 0:
+        print(f"Epoch {epoch+1}/{NUM_EPOCHS}")
+        print(f"  Train Loss: {train_loss:.4f}") #, Train Acc: {train_acc:.4f}")
+        print(f"  Val Loss: {val_loss:.4f}, Val Acc: {val_acc:.4f}")
+        print(f"  Patience: {patience_counter}/{PATIENCE}")
+        print(f"  Train AUC: {train_auc:.4f}, Val AUC: {val_auc:.4f}")
+        if USE_LEARNABLE:
+            print(f"  Alpha: {loss_fn.alpha.item():.4f}, Beta: {loss_fn.beta.item():.4f}")
 
         if (epoch + 1) % 20 == 0:
-            tqdm.write("\n=== Distance Clustering Analysis ===")
+            print("\n=== Distance Clustering Analysis ===")
             similar_mean, dissimilar_mean, separation = plot_distance_clustering(
                 train_dists, train_labels_epoch, f"Training - Epoch {epoch+1}", final=False
             )
-            tqdm.write(f"Separation: {separation:.4f}\n")
+            print(f"Separation: {separation:.4f}\n")
 
         if patience_counter >= PATIENCE:
-            tqdm.write(f"\n Early stopping at epoch {epoch+1}")
+            print(f"\n Early stopping at epoch {epoch+1}")
             break
 
     if best_model_state is not None:
@@ -994,12 +1073,19 @@ def main():
         projection_net, loss_fn, test_loader, device
     )
 
+    gene_aware_test_loader = GeneAwareDataLoader(test_dataset, batch_size=BATCH_SIZE, shuffle=False)
+    gene_aware_final_loss, gene_aware_final_similarities, gene_aware_final_labels, gene_aware_final_dists, gene_aware_final_quartiles, gene_aware_final_projections = evaluate_model(
+        projection_net, loss_fn, gene_aware_test_loader, device
+    )
+
     test_loss = final_loss
     #test_acc, test_precision, test_recall, test_f1 = kmeans_metrics(final_projections, final_quartiles, n_clusters=2)
     #test_acc, test_precision, test_recall, test_f1 = logreg_metrics(train_projections, train_quartiles, final_projections, final_quartiles)
     test_acc, test_precision, test_recall, test_f1 = contrastive_metrics(final_similarities, final_labels)
+    gene_aware_test_acc, gene_aware_test_precision, gene_aware_test_recall, gene_aware_test_f1 = contrastive_metrics(gene_aware_final_similarities, gene_aware_final_labels)
 
     test_auc = roc_auc_score(final_labels, final_similarities) #auc based on similarities
+    gene_aware_test_auc = roc_auc_score(gene_aware_final_labels, gene_aware_final_similarities)
 
     print(f"\nTest Metrics:")
     print(f"  Loss: {test_loss:.4f}")
@@ -1019,6 +1105,7 @@ def main():
 
     with open(RESULTS_FILE, 'a') as f:
         f.write(f'{RUN_NAME},{test_loss},{test_acc},{test_precision},{test_recall},{test_f1},{test_auc}\n')
+        f.write(f'{RUN_NAME}_gene_aware_evaluation,-,{gene_aware_test_acc},{gene_aware_test_precision},{gene_aware_test_recall},{gene_aware_test_f1},{gene_aware_test_auc}\n')
 
     print(f"\nDistance Statistics:")
     print(f"  Mean: {np.mean(final_dists):.4f}")
@@ -1035,7 +1122,11 @@ def main():
 
     sample_seqs = [test_seqs[i] for i in sample_indices]
     sample_dms = [test_dms[i] for i in sample_indices]
-    sample_embeddings = torch.stack([seq_to_embedding[seq] for seq in sample_seqs])
+
+    if not args.freeze_esm:
+        seq_to_embedding = extract_esm_embeddings(esm_model, sample_seqs)
+    else:
+        seq_to_embedding = torch.stack([seq_to_embedding[seq] for seq in sample_seqs])
 
     visualize_embeddings_tsne(sample_embeddings, sample_dms,
                               f"Original ESM Layer {args.embedding_layer} Embeddings (DMS Colored)")
