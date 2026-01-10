@@ -27,6 +27,8 @@ import pickle
 import os
 import argparse
 from transformers import AutoTokenizer, AutoModel
+import scripts.h5_utils as h5_utils
+import json
 
 warnings.filterwarnings('ignore')
 
@@ -75,7 +77,6 @@ def parse_args():
 args = parse_args()
 
 #EMBEDDINGS_PATH = args.embeddings_path
-seq_to_embedding = {}
 DATA_PATH = args.data_path
 RUN_NAME = args.run_name
 
@@ -96,6 +97,7 @@ if args.model_cache is not None:
 #results dir
 RESULTS_DIR = f'{args.base_results_dir}/{args.run_name}'
 os.makedirs(RESULTS_DIR, exist_ok=True)
+json.dump(vars(args), open(f'{RESULTS_DIR}/args.json', 'w'))
 os.makedirs(f'{RESULTS_DIR}/training_figs', exist_ok=True)
 RESULTS_FILE = f'{args.base_results_dir}/results.csv'
 if not os.path.exists(RESULTS_FILE):
@@ -131,6 +133,24 @@ def set_seed(seed=42):
 
 set_seed(42)  # Call this at the start of your script
 
+def esm_batch(sequences):
+    #rint('ESM BATCH METHOD')
+    tokenized = tokenizer(sequences, padding=True, truncation=True, max_length=args.esm_max_length, return_tensors="pt")
+    batch_tokens = tokenized['input_ids'].to(device)
+    attention_mask = tokenized['attention_mask'].to(device)
+    with torch.no_grad(): #remove this once we're ready to finetune
+        results = esm_model(input_ids=batch_tokens, attention_mask=attention_mask, output_hidden_states=False)
+    reps = results["last_hidden_state"].to(device)    
+    #mean pooling
+    mask = attention_mask.unsqueeze(-1)          # (B, L, 1)
+    masked_reps = reps * mask
+    sum_reps = masked_reps.sum(dim=1)
+    lengths = mask.sum(dim=1)
+    embeddings_batch = sum_reps / lengths         # (B, H)
+    out = embeddings_batch
+
+    return out
+
 class DMSContrastiveDataset(Dataset):
     def __init__(self, sequences, quartiles, dms_scores, genes):
         self.sequences = sequences
@@ -157,6 +177,26 @@ class DMSContrastiveDataset(Dataset):
             'sequence': sequence,
             'gene': gene,
         }
+
+def load_embeddings_h5(sequences):
+    if args.embeddings_path is not None:
+        embeddings, missing_seqs, missing_indices = h5_utils.load_embeddings(args.embeddings_path, sequences)
+        
+        if len(missing_seqs) > 0:
+            missing_embeddings = esm_batch(missing_seqs)
+            h5_utils.save_embeddings(args.embeddings_path, missing_seqs, missing_embeddings)
+            #insert missing embeddings back into embeddings
+            for i, idx in enumerate(missing_indices):
+                embeddings[idx] = missing_embeddings[i]
+    else: 
+        raise NotImplementedError('embeddings_path must be specified')
+
+    embeddings = torch.stack([
+        torch.as_tensor(e, dtype=torch.float32).to(device)
+        for e in embeddings
+    ])
+
+    return embeddings
 
 
 class GeneAwareDataLoader:
@@ -289,15 +329,21 @@ class DataLoader():
         sequences = [item['sequence'] for item in batch]
         genes = [item['gene'] for item in batch]
 
-        if self.gene_to_wt is not None:
+        if args.normalize_to_wt:
             wt_sequences = [self.gene_to_wt[gene] for gene in genes]
+            wt_embeddings = load_embeddings_h5(wt_sequences)
+        else:
+            wt_embeddings = None
+
+        embeddings = load_embeddings_h5(sequences)
 
         return {
             'quartiles': quartiles,
             'dms_scores': dms_scores,
             'sequences': sequences,
             'genes': genes,
-            'wt_sequences': wt_sequences
+            'wt_embeddings': wt_embeddings,
+            'embeddings': embeddings
         }
 
     def __len__(self):
@@ -331,43 +377,27 @@ class ContrastiveNetwork(nn.Module):
         self.normalize_output = normalize_output
 
     def forward(self, batch):
-        #print('forward 1')
-        if args.freeze_esm:
-            out = torch.stack([seq_to_embedding[seq] for seq in batch['sequences']]).to(device)
-        else:
-            tokenized = tokenizer(batch['sequences'], padding=True, truncation=True, max_length=args.esm_max_length, return_tensors="pt")
-            batch_tokens = tokenized['input_ids'].to(device)
-            attention_mask = tokenized['attention_mask'].to(device)
-            with torch.no_grad(): #remove this once we're ready to finetune
-                results = esm_model(input_ids=batch_tokens, attention_mask=attention_mask, output_hidden_states=False)
-            reps = results["last_hidden_state"].to(device)
-            if args.normalize_to_wt:
-                tokenized = tokenizer(batch['wt_sequences'], padding=True, truncation=True, max_length=args.esm_max_length, return_tensors="pt")
-                batch_tokens = tokenized['input_ids'].to(device)
-                attention_mask = tokenized['attention_mask'].to(device)
-                with torch.no_grad(): #remove this once we're ready to finetune
-                    results = esm_model(input_ids=batch_tokens, attention_mask=attention_mask, output_hidden_states=False)
-                wt_reps = results["last_hidden_state"].to(device)
 
-                reps = reps - wt_reps
-            #print(f'reps shape: {reps.shape()}')
-            
-            #mean pooling
-            mask = attention_mask.unsqueeze(-1)          # (B, L, 1)
-            masked_reps = reps * mask
-            sum_reps = masked_reps.sum(dim=1)
-            lengths = mask.sum(dim=1)
+        out = batch['embeddings']
 
-            embeddings_batch = sum_reps / lengths         # (B, H)
-            out = embeddings_batch
+        if args.normalize_to_wt:
+            out = out - batch['wt_embeddings']
 
+        x = self.projection(out) 
+        if self.normalize_output:
+            #l2 normalize
+            x = nn.functional.normalize(x, p=2, dim=-1)
+        return x
+
+        """#print('forward 1'
+        out = batch['embeddings']
         #reps = out["representations"][self.esm_layer]
         #embs = reps.mean(dim=1) #mean pool
         x = self.projection(out) 
         if self.normalize_output:
             #l2 normalize
             x = nn.functional.normalize(x, p=2, dim=-1)
-        return x
+        return x"""
 
 class ContrastiveLoss(nn.Module):
     def __init__(self, distance_metric="cosine", use_learnable=True):
@@ -438,29 +468,6 @@ class ContrastiveLoss(nn.Module):
         all_labels = labels.cpu().tolist()
 
         return loss, all_similarities, all_distances, all_labels
-
-def load_embeddings(embeddings_path):
-    print(f"Loading embeddings from {embeddings_path}")
-
-    if not os.path.exists(embeddings_path):
-        print(f"No embeddings found at {embeddings_path}, will generate embeddings during training")
-        return {}
-
-    with open(embeddings_path, 'rb') as f:
-        seq_to_embedding = pickle.load(f)
-
-    print(f"Loaded {len(seq_to_embedding)} embeddings")
-    if seq_to_embedding:
-        print(f"Embedding shape: {list(seq_to_embedding.values())[0].shape}")
-
-    return seq_to_embedding
-
-def save_embeddings(seq_to_embedding, embeddings_path):
-    #print(f"Saving embeddings to {embeddings_path}")
-    tmp_path = args.embeddings_path + ".tmp"
-    with open(tmp_path, "wb") as f:
-        pickle.dump(seq_to_embedding, f)
-    os.replace(tmp_path, args.embeddings_path)  # atomic move
 
 def load_and_preprocess_data(data_path):
     print(f"Loading data from {data_path}")
@@ -794,69 +801,6 @@ def visualize_embeddings_tsne(embeddings, labels, title="t-SNE Visualization"):
     plt.tight_layout()
     plt.savefig(f'{RESULTS_DIR}/{title}.png')
 
-def extract_esm_embeddings(esm_model, sequences):
-    """Extract ESM embeddings for a list of sequences"""
-    print(f"Extracting ESM embeddings for {len(sequences)} sequences")
-    global seq_to_embedding
-    esm_model.eval()
-    
-    # Prepare batches
-    batches = []
-    for i in range(0, len(sequences), 100):
-        batch = sequences[i:i+100]
-        batches.append(batch)
-    
-    batch_idx=0
-    # Extract embeddings
-    for batch in tqdm(batches):
-        tokenized = tokenizer(batch, padding=True, truncation=True, max_length=args.esm_max_length, return_tensors="pt")
-        batch_tokens = tokenized['input_ids']
-        attention_mask = tokenized['attention_mask']
-
-        with torch.no_grad():
-            results = esm_model(input_ids=batch_tokens, attention_mask=attention_mask, output_hidden_states=True)
-            reps = results["hidden_states"][args.esm_layer]
-            print(f"Number of layers: {len(esm_model.encoder.layer)}")  # Should be 33
-            print(f"Hidden states shape: {len(results['hidden_states'])}")  # Should be 34 (33 layers + input embeddings)
-            #print(f'reps shape: {reps.shape()}')
-            
-            #mean pooling
-            mask = attention_mask.unsqueeze(-1)          # (B, L, 1)
-            masked_reps = reps * mask
-            sum_reps = masked_reps.sum(dim=1)
-            lengths = mask.sum(dim=1)
-
-            embeddings_batch = sum_reps / lengths         # (B, H)
-            embeddings_batch = embeddings_batch.cpu()
-
-            for seq, emb in zip(batch, embeddings_batch):
-                seq_to_embedding[seq] = emb
-
-            if batch_idx % 10 == 0:
-                save_embeddings(seq_to_embedding, args.embeddings_path)
-            batch_idx += 1
-
-    save_embeddings(seq_to_embedding, args.embeddings_path)
-    return seq_to_embedding
-    
-def get_missing_embeddings(seq_to_embedding, esm_model, sequences):
-    """Get embeddings for tokens that are not in the existing dictionary"""
-    print(f"Getting embeddings for {len(sequences)} sequences")
-
-    # Get sequences that don't have embeddings
-    missing_sequences = [seq for seq in sequences if seq not in seq_to_embedding.keys()]
-    print(f"Found {len(missing_sequences)} sequences without embeddings")
-    
-    if len(missing_sequences) == 0:
-        return seq_to_embedding
-    
-    # Extract embeddings for missing sequences
-    seq_to_embedding = extract_esm_embeddings(esm_model, missing_sequences)
-    
-    print(f"Total embeddings now: {len(seq_to_embedding)}")
-    return seq_to_embedding
-
-
 def main():
     print("="*80)
     print(f"Running Contrastive Learning for {RUN_NAME}")
@@ -891,11 +835,6 @@ def main():
     else:
         gene_to_wt = None
 
-    #filter to sequences that have embeddings
-    #available_sequences = set(seq_to_embedding.keys())
-    #df = df[df['mutated_sequence'].isin(available_sequences)]
-    #print(f"\n Filtered to {len(df)} samples with available embeddings")
-
     #create train/test split
     train_df, test_df = create_train_test_split(df, split_by_gene=args.split_by_gene, test_size=0.2)
 
@@ -910,25 +849,15 @@ def main():
     test_dms = test_df['DMS_score'].tolist()
     test_genes = test_df['filename'].tolist()
 
-    #print(f'train seq length distribution: {pd.Series(train_seqs).str.len().describe()}')
-    #print(f'test seq length distribution: {pd.Series(test_seqs).str.len().describe()}')
+    print(f'train seq length distribution: {pd.Series(train_seqs).str.len().describe()}')
+    print(f'test seq length distribution: {pd.Series(test_seqs).str.len().describe()}')
 
-    #tokenize
-    #print('Tokenizing...')
-    #train_tokens = tokenizer(train_seqs, padding='max_length', truncation=True, max_length=args.esm_max_length, return_tensors="pt")['input_ids']
-    #test_tokens = tokenizer(test_seqs, padding='max_length', truncation=True, max_length=args.esm_max_length, return_tensors="pt")['input_ids']
-
-    #load embeddings
-    global seq_to_embedding
-    if args.freeze_esm:
-        if args.embeddings_path is None:
-            raise ValueError("Embeddings path must be specified if freeze_esm is True")
-        seq_to_embedding = load_embeddings(args.embeddings_path)
-        print(f'Loaded {len(seq_to_embedding)} embeddings from {args.embeddings_path}')
-        seq_to_embedding = get_missing_embeddings(seq_to_embedding, esm_model, train_seqs + test_seqs)
-        save_embeddings(seq_to_embedding, args.embeddings_path)
+    #init h5 file for embeddings
+    if args.embeddings_path is not None:
+        h5_utils.init_h5(args.embeddings_path, len(train_seqs)+len(test_seqs)+filtered_count, embed_dim=args.input_dim)
     else:
-        seq_to_embedding = None
+        raise ValueError("Embeddings path must be specified")
+    
 
     #create datasets
     train_dataset = DMSContrastiveDataset(train_seqs, train_quarts, train_dms,
@@ -1122,10 +1051,7 @@ def main():
     sample_seqs = [test_seqs[i] for i in sample_indices]
     sample_dms = [test_dms[i] for i in sample_indices]
 
-    if not args.freeze_esm:
-        seq_to_embedding = extract_esm_embeddings(esm_model, sample_seqs)
-    else:
-        seq_to_embedding = torch.stack([seq_to_embedding[seq] for seq in sample_seqs])
+    sample_embeddings = h5_utils.load_embeddings(args.embeddings_path, sample_seqs)
 
     visualize_embeddings_tsne(sample_embeddings, sample_dms,
                               f"Original ESM Layer {args.embedding_layer} Embeddings (DMS Colored)")
@@ -1150,6 +1076,7 @@ def main():
         }
     }, f'{RESULTS_DIR}/{RUN_NAME}.pt')
     print(f" Model saved to '{RESULTS_DIR}/{RUN_NAME}.pt'")
+    h5_utils.close_h5()
 
 main()
 

@@ -15,18 +15,19 @@ EMBEDDING_LAYER="layer33_mean"
 for COARSE_SELECTION_TYPE in "Stability" "Binding" "OrganismalFitness" "Expression" "Activity"; do
     echo "Running ${COARSE_SELECTION_TYPE} ${EMBEDDING_LAYER}"
 
-    RUN_NAME="V3_t6_8m_${COARSE_SELECTION_TYPE}_${EMBEDDING_LAYER}"
+    RUN_NAME="650M_h5test_${COARSE_SELECTION_TYPE}_${EMBEDDING_LAYER}"
 
     python -u pipeline.py --run_name $RUN_NAME \
         --data_path $BASE_DATA_PATH/datasets/${COARSE_SELECTION_TYPE}.csv \
-        --embeddings_path $BASE_DATA_PATH/embeddings/${COARSE_SELECTION_TYPE}/test_embeddings_esm2_${EMBEDDING_LAYER}_mean.pkl \
+        --embeddings_path $BASE_DATA_PATH/embeddings/${COARSE_SELECTION_TYPE}/650M_t33_mean_layer33.h5 \
         --model_cache /gpfs/scratch/jvaska/cache/esm \
         --model_name facebook/esm2_t33_650M_UR50D \
         --esm_max_length 600 \
         --input_dim 1280 \
         --batch_size 32 \
-        --patience 5 \
+        --patience 2 \
         --normalize_to_wt \
+        --dropout 0.0 \
         --metadata_path $BASE_DATA_PATH/datasets/DMS_substitutions.csv
 
 done
