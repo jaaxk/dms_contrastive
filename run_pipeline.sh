@@ -21,10 +21,10 @@ for COARSE_SELECTION_TYPE in "Stability" "Binding" "OrganismalFitness" "Expressi
         --data_path $BASE_DATA_PATH/datasets/${COARSE_SELECTION_TYPE}.csv \
         --embeddings_path $BASE_DATA_PATH/embeddings/${COARSE_SELECTION_TYPE}/test_embeddings_esm2_${EMBEDDING_LAYER}_mean.pkl \
         --model_cache /gpfs/scratch/jvaska/cache/esm \
-        --model_name facebook/esm2_t30_150M_UR50D \
+        --model_name facebook/esm2_t33_650M_UR50D \
         --esm_max_length 600 \
-        --input_dim 640 \
-        --batch_size 128 \
+        --input_dim 1280 \
+        --batch_size 32 \
         --patience 5 \
         --normalize_to_wt \
         --metadata_path $BASE_DATA_PATH/datasets/DMS_substitutions.csv

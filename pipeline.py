@@ -635,11 +635,10 @@ def evaluate_model(projection_net, loss_fn, dataloader, device):
 
     with torch.no_grad():
         for batch in tqdm(dataloader, desc="Evaluation"):
-            sequences = batch['sequences']
             quartiles = batch['quartiles']
 
             #project embeddings
-            projected = projection_net(sequences)
+            projected = projection_net(batch)
             all_projections.extend(projected.cpu().detach().numpy())
 
             #compute loss
