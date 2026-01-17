@@ -1,7 +1,7 @@
 #!/bin/bash
 #SBATCH -p v100
 #SBATCH --gres=gpu:1
-#SBATCH --time=8:00:00
+#SBATCH --time=24:00:00
 #SBATCH --mem=120G
 #SBATCH --output=logs/%j.out
 #SBATCH --job-name=dms_cl
@@ -12,10 +12,10 @@ BASE_DATA_PATH="/gpfs/scratch/jvaska/brandes_lab/dms_data"
 
 EMBEDDING_LAYER="layer33_mean"
 
-for COARSE_SELECTION_TYPE in "Stability" "Binding" "OrganismalFitness" "Expression" "Activity"; do
+for COARSE_SELECTION_TYPE in "Stability" "OrganismalFitness" "Activity" "Binding" "Expression" ; do
     echo "Running ${COARSE_SELECTION_TYPE} ${EMBEDDING_LAYER}"
 
-    RUN_NAME="650M_h5test_${COARSE_SELECTION_TYPE}_${EMBEDDING_LAYER}"
+    RUN_NAME="650M_normalizewt_differentgenes_${COARSE_SELECTION_TYPE}_${EMBEDDING_LAYER}"
 
     python -u pipeline.py --run_name $RUN_NAME \
         --data_path $BASE_DATA_PATH/datasets/${COARSE_SELECTION_TYPE}.csv \
@@ -28,6 +28,7 @@ for COARSE_SELECTION_TYPE in "Stability" "Binding" "OrganismalFitness" "Expressi
         --patience 2 \
         --normalize_to_wt \
         --dropout 0.0 \
-        --metadata_path $BASE_DATA_PATH/datasets/DMS_substitutions.csv
+        --metadata_path $BASE_DATA_PATH/datasets/DMS_substitutions.csv \
+        --num_epochs 1
 
 done

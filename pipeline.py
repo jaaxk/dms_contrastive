@@ -198,98 +198,28 @@ def load_embeddings_h5(sequences):
 
     return embeddings
 
-
-class GeneAwareDataLoader:
-    def __init__(self, dataset, batch_size=16, shuffle=True, balance_quartiles=True):
-        self.dataset = dataset
-        self.batch_size = batch_size
-        self.shuffle = shuffle
-        self.balance_quartiles = balance_quartiles
-
-        print("Using same gene batch sampling - each batch will contain variants from the same gene")
-        #group indices by gene and quartile
-        self.gene_groups = {}
-        for i, gene in enumerate(dataset.genes):
-            if gene not in self.gene_groups:
-                self.gene_groups[gene] = {'high': [], 'low': []}
-            quartile = dataset.quartiles[i]
-            self.gene_groups[gene][quartile].append(i)
-
-        print(f"Gene-aware loader created for {len(self.gene_groups)} genes")
-        for gene, quartile_dict in list(self.gene_groups.items())[:3]:
-            print(f"  {gene}: {len(quartile_dict['high'])} high, {len(quartile_dict['low'])} low")
-
-    def __iter__(self):
-        all_batches = []
-
-        for gene, quartile_dict in self.gene_groups.items():
-            high_indices = quartile_dict['high'].copy()
-            low_indices = quartile_dict['low'].copy()
-
-            if self.shuffle:
-                np.random.shuffle(high_indices)
-                np.random.shuffle(low_indices)
-
-            if self.balance_quartiles and len(high_indices) > 0 and len(low_indices) > 0:
-                half_batch = self.batch_size // 2
-
-                num_batches = min(len(high_indices) // half_batch, len(low_indices) // half_batch)
-
-                for i in range(num_batches):
-                    batch_high = high_indices[i*half_batch:(i+1)*half_batch]
-                    batch_low = low_indices[i*half_batch:(i+1)*half_batch]
-                    batch_indices = batch_high + batch_low
-
-                    if self.shuffle:
-                        np.random.shuffle(batch_indices)
-
-                    batch = [self.dataset[idx] for idx in batch_indices]
-                    all_batches.append(batch)
-            else:
-                #fall back to unbalanced batching if needed
-                all_indices = high_indices + low_indices
-                if self.shuffle:
-                    np.random.shuffle(all_indices)
-
-                for i in range(0, len(all_indices), self.batch_size):
-                    batch_indices = all_indices[i:i+self.batch_size]
-                    if len(batch_indices) >= 2:
-                        batch = [self.dataset[idx] for idx in batch_indices]
-                        all_batches.append(batch)
-
-        if self.shuffle:
-            np.random.shuffle(all_batches)
-
-        for batch in all_batches:
-            yield self._collate_batch(batch)
-
-    def _collate_batch(self, batch):
-        #embeddings = torch.stack([item['embedding'] for item in batch])
-        quartiles = [item['quartile'] for item in batch]
-        dms_scores = [item['dms_score'] for item in batch]
-        sequences = [item['sequence'] for item in batch]
-        genes = [item['gene'] for item in batch]
-
-        return {
-            'quartiles': quartiles,
-            'dms_scores': dms_scores,
-            'sequences': sequences,
-            'genes': genes
-        }
-
-    def __len__(self):
-        total_samples = len(self.dataset)
-        return total_samples // self.batch_size
-
 class DataLoader():
-    def __init__(self, dataset, batch_size=16, shuffle=True, balance_quartiles=True, gene_to_wt=None):
+    def __init__(self, dataset, batch_size=16, shuffle=True, balance_quartiles=True, gene_to_wt=None, gene_aware=False):
         self.dataset = dataset
         self.batch_size = batch_size
         self.shuffle = shuffle
         self.balance_quartiles = balance_quartiles
         self.gene_to_wt = gene_to_wt
+        self.gene_aware = gene_aware
 
-        print('Using basic data loader - no gene grouping')
+        if gene_aware:
+            self.gene_groups = {}
+            for i, gene in enumerate(dataset.genes):
+                if gene not in self.gene_groups:
+                    self.gene_groups[gene] = {'high': [], 'low': []}
+                quartile = dataset.quartiles[i]
+                self.gene_groups[gene][quartile].append(i)
+
+            print(f"Gene-aware loader created for {len(self.gene_groups)} genes")
+            for gene, quartile_dict in list(self.gene_groups.items())[:3]:
+                print(f"  {gene}: {len(quartile_dict['high'])} high, {len(quartile_dict['low'])} low")
+        else:
+            print('Using basic data loader - no gene grouping')
         
         # Standard behavior - no gene grouping
         self.indices = list(range(len(dataset)))
@@ -298,29 +228,64 @@ class DataLoader():
 
     def __iter__(self):
         # Separate indices by quartile
-        high_indices = [i for i, q in enumerate(self.dataset.quartiles) if q == 'high']
-        low_indices = [i for i, q in enumerate(self.dataset.quartiles) if q == 'low']
-        
-        if self.shuffle:
-            np.random.shuffle(high_indices)
-            np.random.shuffle(low_indices)
-        
-        # Determine the number of batches we can make
-        half_batch = self.batch_size // 2
-        num_batches = min(len(high_indices), len(low_indices)) // half_batch
-        
-        for i in range(num_batches):
-            # Take equal number of high and low quartile samples
-            batch_high = high_indices[i*half_batch:(i+1)*half_batch]
-            batch_low = low_indices[i*half_batch:(i+1)*half_batch]
-            batch_indices = batch_high + batch_low
-            
-            # Shuffle the combined batch
+        if self.gene_aware:
+            all_batches = []
+
+            for gene, quartile_dict in self.gene_groups.items():
+                high_indices = quartile_dict['high'].copy()
+                low_indices = quartile_dict['low'].copy()
+
+                if self.shuffle:
+                    np.random.shuffle(high_indices)
+                    np.random.shuffle(low_indices)
+
+                if self.balance_quartiles and len(high_indices) > 0 and len(low_indices) > 0:
+                    half_batch = self.batch_size // 2
+
+                    num_batches = min(len(high_indices) // half_batch, len(low_indices) // half_batch)
+
+                    for i in range(num_batches):
+                        batch_high = high_indices[i*half_batch:(i+1)*half_batch]
+                        batch_low = low_indices[i*half_batch:(i+1)*half_batch]
+                        batch_indices = batch_high + batch_low
+
+                        if self.shuffle:
+                            np.random.shuffle(batch_indices)
+
+                        batch = [self.dataset[idx] for idx in batch_indices]
+                        all_batches.append(batch)
+
             if self.shuffle:
-                np.random.shuffle(batch_indices)
+                np.random.shuffle(all_batches)
+
+            for batch in all_batches:
+                yield self._collate_batch(batch)
+
+        else:
+
+            high_indices = [i for i, q in enumerate(self.dataset.quartiles) if q == 'high']
+            low_indices = [i for i, q in enumerate(self.dataset.quartiles) if q == 'low']
+            
+            if self.shuffle:
+                np.random.shuffle(high_indices)
+                np.random.shuffle(low_indices)
+            
+            # Determine the number of batches we can make
+            half_batch = self.batch_size // 2
+            num_batches = min(len(high_indices), len(low_indices)) // half_batch
+            
+            for i in range(num_batches):
+                # Take equal number of high and low quartile samples
+                batch_high = high_indices[i*half_batch:(i+1)*half_batch]
+                batch_low = low_indices[i*half_batch:(i+1)*half_batch]
+                batch_indices = batch_high + batch_low
                 
-            batch = [self.dataset[idx] for idx in batch_indices]
-            yield self._collate_batch(batch)
+                # Shuffle the combined batch
+                if self.shuffle:
+                    np.random.shuffle(batch_indices)
+                    
+                batch = [self.dataset[idx] for idx in batch_indices]
+                yield self._collate_batch(batch)
 
     def _collate_batch(self, batch):
         #embeddings = torch.stack([item['embedding'] for item in batch])
@@ -350,7 +315,7 @@ class DataLoader():
         return len(self.indices) // self.batch_size
 
 class ContrastiveNetwork(nn.Module):
-    def __init__(self, esm_model, input_dim=1280, hidden_dims=[512, 256, 128], normalize_output=False, esm_layer=33):
+    def __init__(self, esm_model, input_dim=1280, hidden_dims=[512, 256, 128], normalize_output=False, esm_layer=33, esm_only=False):
         super(ContrastiveNetwork, self).__init__()
 
         if esm_layer != 33:
@@ -358,6 +323,7 @@ class ContrastiveNetwork(nn.Module):
 
         self.esm = esm_model
         self.esm_layer = esm_layer
+        self.esm_only = esm_only
 
         layers = []
         prev_dim = input_dim
@@ -383,7 +349,11 @@ class ContrastiveNetwork(nn.Module):
         if args.normalize_to_wt:
             out = out - batch['wt_embeddings']
 
-        x = self.projection(out) 
+        if self.esm_only:
+            x = out
+        else:
+            x = self.projection(out) 
+        
         if self.normalize_output:
             #l2 normalize
             x = nn.functional.normalize(x, p=2, dim=-1)
@@ -867,11 +837,11 @@ def main():
 
     #create data loaders
     if args.same_gene_batch:
-        train_loader = GeneAwareDataLoader(train_dataset, batch_size=BATCH_SIZE, shuffle=True)
-        test_loader = GeneAwareDataLoader(test_dataset, batch_size=BATCH_SIZE, shuffle=False)
+        train_loader = DataLoader(train_dataset, batch_size=BATCH_SIZE, gene_to_wt = gene_to_wt, shuffle=True, gene_aware=True)
+        test_loader = DataLoader(test_dataset, batch_size=BATCH_SIZE, gene_to_wt = gene_to_wt, shuffle=False, gene_aware=True)
     else:
-        train_loader = DataLoader(train_dataset, batch_size=BATCH_SIZE, shuffle=True, gene_to_wt=gene_to_wt)
-        test_loader = DataLoader(test_dataset, batch_size=BATCH_SIZE, shuffle=False, gene_to_wt=gene_to_wt)
+        train_loader = DataLoader(train_dataset, batch_size=BATCH_SIZE, gene_to_wt = gene_to_wt, shuffle=True, gene_aware=False)
+        test_loader = DataLoader(test_dataset, batch_size=BATCH_SIZE, gene_to_wt = gene_to_wt, shuffle=False, gene_aware=False)
 
     print(f"\n Data loaders created")
     print(f"   Train batches: ~{len(train_loader)}")
@@ -997,23 +967,37 @@ def main():
     plot_training_metrics(train_losses, val_losses, train_aucs, val_aucs)
 
     print("\n=== FINAL EVALUATION ===")
+
+    #different-gene batch evaluation
     final_loss, final_similarities, final_labels, final_dists, final_quartiles, final_projections = evaluate_model(
         projection_net, loss_fn, test_loader, device
     )
+    test_loss = final_loss
+    test_acc, test_precision, test_recall, test_f1 = contrastive_metrics(final_similarities, final_labels)
+    test_auc = roc_auc_score(final_labels, final_similarities) #auc based on similarities
 
-    gene_aware_test_loader = GeneAwareDataLoader(test_dataset, batch_size=BATCH_SIZE, shuffle=False)
+    #Gene-aware evaluation
+    gene_aware_test_loader = DataLoader(test_dataset, batch_size=BATCH_SIZE, shuffle=False, gene_to_wt=gene_to_wt, gene_aware=True)
     gene_aware_final_loss, gene_aware_final_similarities, gene_aware_final_labels, gene_aware_final_dists, gene_aware_final_quartiles, gene_aware_final_projections = evaluate_model(
         projection_net, loss_fn, gene_aware_test_loader, device
     )
-
-    test_loss = final_loss
-    #test_acc, test_precision, test_recall, test_f1 = kmeans_metrics(final_projections, final_quartiles, n_clusters=2)
-    #test_acc, test_precision, test_recall, test_f1 = logreg_metrics(train_projections, train_quartiles, final_projections, final_quartiles)
-    test_acc, test_precision, test_recall, test_f1 = contrastive_metrics(final_similarities, final_labels)
     gene_aware_test_acc, gene_aware_test_precision, gene_aware_test_recall, gene_aware_test_f1 = contrastive_metrics(gene_aware_final_similarities, gene_aware_final_labels)
-
-    test_auc = roc_auc_score(final_labels, final_similarities) #auc based on similarities
     gene_aware_test_auc = roc_auc_score(gene_aware_final_labels, gene_aware_final_similarities)
+
+    #original ESM evaluation
+    esm_only_model = ContrastiveNetwork(
+        esm_model=esm_model,
+        input_dim=args.input_dim,
+        hidden_dims=HIDDEN_DIMS,
+        normalize_output=NORMALIZE_OUTPUT,
+        esm_layer=args.esm_layer,
+        esm_only=True
+    ).to(device)
+    original_test_loss, original_test_similarities, original_test_labels, original_test_dists, original_test_quartiles, original_test_projections = evaluate_model(
+        esm_only_model, loss_fn, test_loader, device
+    )
+    original_test_acc, original_test_precision, original_test_recall, original_test_f1 = contrastive_metrics(original_test_similarities, original_test_labels)
+    original_test_auc = roc_auc_score(original_test_labels, original_test_similarities)
 
     print(f"\nTest Metrics:")
     print(f"  Loss: {test_loss:.4f}")
@@ -1034,6 +1018,7 @@ def main():
     with open(RESULTS_FILE, 'a') as f:
         f.write(f'{RUN_NAME},{test_loss},{test_acc},{test_precision},{test_recall},{test_f1},{test_auc}\n')
         f.write(f'{RUN_NAME}_gene_aware_evaluation,-,{gene_aware_test_acc},{gene_aware_test_precision},{gene_aware_test_recall},{gene_aware_test_f1},{gene_aware_test_auc}\n')
+        f.write(f'{RUN_NAME}_original_esm_evaluation,-,{original_test_acc},{original_test_precision},{original_test_recall},{original_test_f1},{original_test_auc}\n')
 
     print(f"\nDistance Statistics:")
     print(f"  Mean: {np.mean(final_dists):.4f}")
@@ -1054,7 +1039,7 @@ def main():
     sample_embeddings = h5_utils.load_embeddings(args.embeddings_path, sample_seqs)
 
     visualize_embeddings_tsne(sample_embeddings, sample_dms,
-                              f"Original ESM Layer {args.embedding_layer} Embeddings (DMS Colored)")
+                              f"Original ESM Layer {args.esm_layer} Embeddings (DMS Colored)")
 
     with torch.no_grad():
         projected_embeddings = projection_net(sample_seqs)
