@@ -315,7 +315,7 @@ class DataLoader():
         return len(self.indices) // self.batch_size
 
 class ContrastiveNetwork(nn.Module):
-    def __init__(self, esm_model, input_dim=1280, hidden_dims=[512, 256, 128], normalize_output=False, esm_layer=33, esm_only=False):
+    def __init__(self, esm_model, input_dim=1280, hidden_dims=[512, 256, 128], normalize_output=False, esm_layer=33, esm_only=False, normalize_to_wt=False):
         super(ContrastiveNetwork, self).__init__()
 
         if esm_layer != 33:
@@ -324,6 +324,7 @@ class ContrastiveNetwork(nn.Module):
         self.esm = esm_model
         self.esm_layer = esm_layer
         self.esm_only = esm_only
+        self.normalize_to_wt = normalize_to_wt
 
         layers = []
         prev_dim = input_dim
@@ -346,7 +347,7 @@ class ContrastiveNetwork(nn.Module):
 
         out = batch['embeddings']
 
-        if args.normalize_to_wt:
+        if self.normalize_to_wt:
             out = out - batch['wt_embeddings']
 
         if self.esm_only:
@@ -865,7 +866,8 @@ def main():
         input_dim=args.input_dim,
         hidden_dims=HIDDEN_DIMS,
         normalize_output=NORMALIZE_OUTPUT,
-        esm_layer=args.esm_layer
+        esm_layer=args.esm_layer,
+        normalize_to_wt=args.normalize_to_wt
     ).to(device)
 
     loss_fn = ContrastiveLoss(
@@ -984,20 +986,52 @@ def main():
     gene_aware_test_acc, gene_aware_test_precision, gene_aware_test_recall, gene_aware_test_f1 = contrastive_metrics(gene_aware_final_similarities, gene_aware_final_labels)
     gene_aware_test_auc = roc_auc_score(gene_aware_final_labels, gene_aware_final_similarities)
 
-    #original ESM evaluation
-    esm_only_model = ContrastiveNetwork(
+    #original ESM evaluation - normalize to wt
+    if args.normalize_to_wt:
+        esm_only_model_normalize = ContrastiveNetwork(
+            esm_model=esm_model,
+            input_dim=args.input_dim,
+            hidden_dims=HIDDEN_DIMS,
+            normalize_output=NORMALIZE_OUTPUT,
+            esm_layer=args.esm_layer,
+            esm_only=True,
+            normalize_to_wt=True
+        ).to(device)
+        original_normalize_test_loss, original_normalize_test_similarities, original_normalize_test_labels, original_normalize_test_dists, original_normalize_test_quartiles, original_normalize_test_projections = evaluate_model(
+            esm_only_model_normalize, loss_fn, test_loader, device
+        )
+        original_normalize_test_acc, original_normalize_test_precision, original_normalize_test_recall, original_normalize_test_f1 = contrastive_metrics(original_normalize_test_similarities, original_normalize_test_labels)
+        original_normalize_test_auc = roc_auc_score(original_normalize_test_labels, original_normalize_test_similarities)
+    else:
+        original_normalize_test_loss = '-'
+        original_normalize_test_similarities = '-'
+        original_normalize_test_labels = '-'
+        original_normalize_test_dists = '-'
+        original_normalize_test_quartiles = '-'
+        original_normalize_test_projections = '-'
+        original_normalize_test_acc = '-'
+        original_normalize_test_precision = '-'
+        original_normalize_test_recall = '-'
+        original_normalize_test_f1 = '-'
+        original_normalize_test_auc = '-'
+
+
+    #otiginal ESM eval - NOT normalizing to wt
+    esm_only_model_no_normalize = ContrastiveNetwork(
         esm_model=esm_model,
         input_dim=args.input_dim,
         hidden_dims=HIDDEN_DIMS,
         normalize_output=NORMALIZE_OUTPUT,
         esm_layer=args.esm_layer,
-        esm_only=True
+        esm_only=True,
+        normalize_to_wt=False
     ).to(device)
     original_test_loss, original_test_similarities, original_test_labels, original_test_dists, original_test_quartiles, original_test_projections = evaluate_model(
-        esm_only_model, loss_fn, test_loader, device
+        esm_only_model_no_normalize, loss_fn, test_loader, device
     )
     original_test_acc, original_test_precision, original_test_recall, original_test_f1 = contrastive_metrics(original_test_similarities, original_test_labels)
     original_test_auc = roc_auc_score(original_test_labels, original_test_similarities)
+
 
     print(f"\nTest Metrics:")
     print(f"  Loss: {test_loss:.4f}")
@@ -1017,8 +1051,8 @@ def main():
 
     with open(RESULTS_FILE, 'a') as f:
         f.write(f'{RUN_NAME},{test_loss},{test_acc},{test_precision},{test_recall},{test_f1},{test_auc}\n')
-        f.write(f'{RUN_NAME}_gene_aware_evaluation,-,{gene_aware_test_acc},{gene_aware_test_precision},{gene_aware_test_recall},{gene_aware_test_f1},{gene_aware_test_auc}\n')
-        f.write(f'{RUN_NAME}_original_esm_evaluation,-,{original_test_acc},{original_test_precision},{original_test_recall},{original_test_f1},{original_test_auc}\n')
+        f.write(f'{RUN_NAME}_og_esm_normalize,-,{original_normalize_test_acc},{original_normalize_test_precision},{original_normalize_test_recall},{original_normalize_test_f1},{original_normalize_test_auc}\n')
+        f.write(f'{RUN_NAME}_og_esm_no_normalize,-,{original_test_acc},{original_test_precision},{original_test_recall},{original_test_f1},{original_test_auc}\n')
 
     print(f"\nDistance Statistics:")
     print(f"  Mean: {np.mean(final_dists):.4f}")

@@ -15,7 +15,7 @@ EMBEDDING_LAYER="layer33_mean"
 for COARSE_SELECTION_TYPE in "Stability" "OrganismalFitness" "Activity" "Binding" "Expression" ; do
     echo "Running ${COARSE_SELECTION_TYPE} ${EMBEDDING_LAYER}"
 
-    RUN_NAME="650M_normalizewt_differentgenes_${COARSE_SELECTION_TYPE}_${EMBEDDING_LAYER}"
+    RUN_NAME="650M_NONORMALIZE_${COARSE_SELECTION_TYPE}_${EMBEDDING_LAYER}"
 
     python -u pipeline.py --run_name $RUN_NAME \
         --data_path $BASE_DATA_PATH/datasets/${COARSE_SELECTION_TYPE}.csv \
@@ -26,9 +26,8 @@ for COARSE_SELECTION_TYPE in "Stability" "OrganismalFitness" "Activity" "Binding
         --input_dim 1280 \
         --batch_size 32 \
         --patience 2 \
-        --normalize_to_wt \
         --dropout 0.0 \
         --metadata_path $BASE_DATA_PATH/datasets/DMS_substitutions.csv \
-        --num_epochs 1
+        --num_epochs 10
 
 done
