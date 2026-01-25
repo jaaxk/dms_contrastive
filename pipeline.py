@@ -21,6 +21,7 @@ from sklearn.model_selection import train_test_split
 from sklearn.cluster import KMeans
 from sklearn.linear_model import LogisticRegression
 import warnings
+import sys
 import esm
 from tqdm import tqdm
 import pickle
@@ -29,6 +30,8 @@ import argparse
 from transformers import AutoTokenizer, AutoModel
 import scripts.h5_utils as h5_utils
 import json
+import re
+from contextlib import redirect_stdout, redirect_stderr
 
 warnings.filterwarnings('ignore')
 
@@ -70,6 +73,7 @@ def parse_args():
     parser.add_argument('--dropout', type=float, default=0.1)
     parser.add_argument('--metadata_path', default=None)
     parser.add_argument('--normalize_to_wt', action='store_true', default=False)
+    parser.add_argument('--ohe_baseline', action='store_true', default=False)
 
     args = parser.parse_args()
     return args
@@ -116,6 +120,17 @@ tokenizer = AutoTokenizer.from_pretrained(args.model_name)
 esm_model.eval() #REMOVE once we are finetuning
 esm_model.to(device)
 
+if args.ohe_baseline:
+    repo_path = os.path.abspath("/gpfs/scratch/jvaska/brandes_lab/esm-variants")
+    if not os.path.exists(repo_path):
+        raise ValueError(f"ESM-variants repository not found at {repo_path}")
+    sys.path.append(repo_path)
+    import esm_variants_utils
+
+    #load model
+    esm_model_llr, esm_alphabet_llr = esm.pretrained.esm2_t33_650M_UR50D()
+    esm_batch_converter_llr = esm_alphabet_llr.get_batch_converter()
+
 # Set all random seeds for reproducibility
 def set_seed(seed=42):
     import random
@@ -152,12 +167,13 @@ def esm_batch(sequences):
     return out
 
 class DMSContrastiveDataset(Dataset):
-    def __init__(self, sequences, quartiles, dms_scores, genes):
+    def __init__(self, sequences, quartiles, dms_scores, genes, mutants=None):
         self.sequences = sequences
         self.quartiles = quartiles
         self.dms_scores = dms_scores
         #self.seq_to_embedding = seq_to_embedding
         self.genes = genes
+        self.mutants = mutants
 
     def __len__(self):
         return len(self.sequences)
@@ -167,6 +183,7 @@ class DMSContrastiveDataset(Dataset):
         quartile = self.quartiles[idx]
         dms_score = self.dms_scores[idx]
         gene = self.genes[idx]
+        mutant = self.mutants[idx] if self.mutants is not None else None
 
         #get precomputed embedding
         #emb = self.seq_to_embedding[seq]
@@ -176,6 +193,7 @@ class DMSContrastiveDataset(Dataset):
             'dms_score': dms_score,
             'sequence': sequence,
             'gene': gene,
+            'mutant': mutant
         }
 
 def load_embeddings_h5(sequences):
@@ -300,6 +318,12 @@ class DataLoader():
         else:
             wt_embeddings = None
 
+        if args.ohe_baseline and self.gene_aware:
+            #print('gene-aware ohe batch iteration')
+            ohe_features = get_ohe_features(wt_sequences, [item['mutant'] for item in batch])
+        else:
+            ohe_features = None
+
         embeddings = load_embeddings_h5(sequences)
 
         return {
@@ -308,7 +332,8 @@ class DataLoader():
             'sequences': sequences,
             'genes': genes,
             'wt_embeddings': wt_embeddings,
-            'embeddings': embeddings
+            'embeddings': embeddings,
+            'ohe_features': ohe_features
         }
 
     def __len__(self):
@@ -760,7 +785,7 @@ def visualize_embeddings_tsne(embeddings, labels, title="t-SNE Visualization"):
 
     #reduce dimensionality
     tsne = TSNE(n_components=2, random_state=42, perplexity=min(30, len(embeddings)-1))
-    embeddings_2d = tsne.fit_transform(embeddings.cpu().numpy())
+    embeddings_2d = tsne.fit_transform(embeddings)
 
     plt.figure(figsize=(10, 8))
     scatter = plt.scatter(embeddings_2d[:, 0], embeddings_2d[:, 1],
@@ -771,6 +796,106 @@ def visualize_embeddings_tsne(embeddings, labels, title="t-SNE Visualization"):
     plt.ylabel('t-SNE 2')
     plt.tight_layout()
     plt.savefig(f'{RESULTS_DIR}/{title}.png')
+
+def calc_esm_llr_scores(wt_seq):
+    _, (raw_llr_scores,) = esm_variants_utils.get_wt_LLR(pd.DataFrame([{'id': '_', 'gene': '_', 'seq': wt_seq, 'length': len(wt_seq)}]), \
+            esm_model_llr, esm_alphabet_llr, esm_batch_converter_llr, device="cpu")
+    raw_seq_results = raw_llr_scores.transpose().stack().reset_index().rename(columns = {'level_0': 'wt_aa_and_pos', 'level_1': 'mut_aa', \
+            0: 'esm_score'})
+    return pd.DataFrame({'mut_name': raw_seq_results['wt_aa_and_pos'].str.replace(' ', '') + raw_seq_results['mut_aa'], \
+            'esm_score': raw_seq_results['esm_score']}).set_index('mut_name')['esm_score']
+
+
+def ohe_llr_baseline(loss_fn, dataloader):
+    print("Calculating OHE LLR baseline")
+
+    all_losses = []
+    all_similarities = []
+    all_distances = []
+    all_labels = []
+
+    for batch in tqdm(dataloader, desc="OHE LLR Baseline"):
+        quartiles = batch['quartiles']
+        ohe_features = batch['ohe_features']
+        #print(ohe_features)
+        #print(ohe_features.shape)
+        #print(type(ohe_features))
+
+        #remove nans and stay consistent with quartiles
+        nan_idx = np.where(np.isnan(ohe_features).any(axis=1))[0]
+        #print(f"Removing {len(nan_idx)} features with nan values")
+        ohe_features = np.delete(ohe_features, nan_idx, axis=0)
+        quartiles = [quartiles[i] for i in range(len(quartiles)) if i not in nan_idx]
+        assert len(ohe_features) == len(quartiles)
+
+        loss, similarities, distances, labels = loss_fn(torch.tensor(ohe_features, dtype=torch.float32), quartiles)
+        all_losses.append(loss.item())
+        all_similarities.extend(similarities)
+        all_distances.extend(distances)
+        all_labels.extend(labels)
+
+    auc = roc_auc_score(all_labels, all_similarities)
+    acc, precision, recall, f1 = contrastive_metrics(all_similarities, all_labels)
+
+    print(f"OHE LLR Baseline - Loss: {np.mean(all_losses):.4f}, AUC: {auc:.4f}, Acc: {acc:.4f}, Precision: {precision:.4f}, Recall: {recall:.4f}, F1: {f1:.4f}")
+
+
+    with open(RESULTS_FILE, 'a') as f:
+        f.write(f'{RUN_NAME}_OHE+LLR_baseline,{np.mean(all_losses)},{acc},{precision},{recall},{f1},{auc}\n')
+        
+
+def get_ohe_features(wt_sequences, mutants):
+    #to be used in DataLoader / collate_batch
+
+    #checks
+    if len(wt_sequences) != len(mutants):
+        raise ValueError('wt_sequences and mutants must have the same length')
+    if len(set(wt_sequences)) != 1:
+        raise ValueError('wt_sequences must all be the same for GENE AWARE data loader - needs new implementation if we want to change this, but relevant')
+    wt_sequence = wt_sequences[0]
+    
+    #constants
+    MISSENSE_PATTERN = re.compile('([A-Z])(\d+)([A-Z])')
+    UNIQUE_AAS = list('ACDEFGHIKLMNPQRSTVWY')
+    aa_to_index = {aa: i for i, aa in enumerate(UNIQUE_AAS)}
+
+    #make features
+    ohe_features = np.zeros((len(mutants), len(wt_sequence), len(UNIQUE_AAS)), dtype = np.int8)
+
+    with open(os.devnull, 'w') as fnull, redirect_stdout(fnull), redirect_stderr(fnull):
+        llr_scores = calc_esm_llr_scores(wt_sequence)
+    llr_scores_ordered = [llr_scores[mutant] if mutant in llr_scores else np.nan for mutant in mutants]
+    llr_scores_reshaped = np.array(llr_scores_ordered).reshape(-1, 1)
+
+    #start with 1s at each WT aa
+    for j, aa in enumerate(wt_sequence):
+        ohe_features[:, j, aa_to_index[aa]] = 1
+
+    for i, mut_name in enumerate(mutants):
+        #print(f'Processing mutation {mut_name}')
+        #handle multiple mutations - this isn't really necessary bc llr cant handle multiple, and these will be removed anyway - but lets keep the logic for now
+        if ':' in mut_name:
+            mut_names = mut_name.split(':')
+        else:
+            mut_names = [mut_name]
+
+        for mut_name in mut_names:
+            (ref_aa, pos, alt_aa), = MISSENSE_PATTERN.findall(mut_name)
+            j = int(pos) - 1
+            ohe_features[i, j, aa_to_index[ref_aa]] = 0
+            ohe_features[i, j, aa_to_index[alt_aa]] = 1 #change wt aa to alt at mutated position
+
+    ohe_features = ohe_features.reshape(len(mutants), -1) #flatten from 3d (n_mutants, seq_len, n_aas) to 2d (n_mutants, seq_len * n_aas)
+    ohe_features = np.concatenate([llr_scores_reshaped, ohe_features], axis = 1) #add llr score to beginning
+    #print(ohe_features.shape)
+    #there will be NaNs if there are two mutated positions (A23Y:A27R), we need to remove these later to stay consistent with quartiles
+    return ohe_features
+
+
+
+        
+        
+
 
 def main():
     print("="*80)
@@ -819,6 +944,10 @@ def main():
     test_quarts = test_df['quartile'].tolist()
     test_dms = test_df['DMS_score'].tolist()
     test_genes = test_df['filename'].tolist()
+    if args.ohe_baseline:
+        test_mutants = test_df['mutant'].tolist()
+    else:
+        test_mutants = None
 
     print(f'train seq length distribution: {pd.Series(train_seqs).str.len().describe()}')
     print(f'test seq length distribution: {pd.Series(test_seqs).str.len().describe()}')
@@ -834,7 +963,7 @@ def main():
     train_dataset = DMSContrastiveDataset(train_seqs, train_quarts, train_dms,
                                           train_genes)
     test_dataset = DMSContrastiveDataset(test_seqs, test_quarts, test_dms,
-                                         test_genes)
+                                         test_genes, test_mutants)
 
     #create data loaders
     if args.same_gene_batch:
@@ -843,6 +972,8 @@ def main():
     else:
         train_loader = DataLoader(train_dataset, batch_size=BATCH_SIZE, gene_to_wt = gene_to_wt, shuffle=True, gene_aware=False)
         test_loader = DataLoader(test_dataset, batch_size=BATCH_SIZE, gene_to_wt = gene_to_wt, shuffle=False, gene_aware=False)
+        gene_aware_test_loader = DataLoader(test_dataset, batch_size=BATCH_SIZE, gene_to_wt=gene_to_wt, shuffle=False, gene_aware=True)
+
 
     print(f"\n Data loaders created")
     print(f"   Train batches: ~{len(train_loader)}")
@@ -882,6 +1013,10 @@ def main():
     if USE_LEARNABLE:
         print(f"   Learnable alpha: {loss_fn.alpha.item():.4f}")
         print(f"   Learnable beta: {loss_fn.beta.item():.4f}")
+
+
+    if args.ohe_baseline:
+        ohe_llr_baseline(loss_fn, gene_aware_test_loader)
 
     #train loop
     train_losses = []
@@ -971,6 +1106,7 @@ def main():
     print("\n=== FINAL EVALUATION ===")
 
     #different-gene batch evaluation
+    print('main batch evaluation')
     final_loss, final_similarities, final_labels, final_dists, final_quartiles, final_projections = evaluate_model(
         projection_net, loss_fn, test_loader, device
     )
@@ -979,7 +1115,7 @@ def main():
     test_auc = roc_auc_score(final_labels, final_similarities) #auc based on similarities
 
     #Gene-aware evaluation
-    gene_aware_test_loader = DataLoader(test_dataset, batch_size=BATCH_SIZE, shuffle=False, gene_to_wt=gene_to_wt, gene_aware=True)
+    print('gene-aware batch evaluation')
     gene_aware_final_loss, gene_aware_final_similarities, gene_aware_final_labels, gene_aware_final_dists, gene_aware_final_quartiles, gene_aware_final_projections = evaluate_model(
         projection_net, loss_fn, gene_aware_test_loader, device
     )
@@ -997,11 +1133,19 @@ def main():
             esm_only=True,
             normalize_to_wt=True
         ).to(device)
+        print('og esm embeddings evaluation - main batch type - normalize to wt')
         original_normalize_test_loss, original_normalize_test_similarities, original_normalize_test_labels, original_normalize_test_dists, original_normalize_test_quartiles, original_normalize_test_projections = evaluate_model(
             esm_only_model_normalize, loss_fn, test_loader, device
         )
         original_normalize_test_acc, original_normalize_test_precision, original_normalize_test_recall, original_normalize_test_f1 = contrastive_metrics(original_normalize_test_similarities, original_normalize_test_labels)
         original_normalize_test_auc = roc_auc_score(original_normalize_test_labels, original_normalize_test_similarities)
+
+        print('og esm embeddings evaluation - gene-aware batch type - normalize to wt')
+        original_normalize_gene_aware_test_loss, original_normalize_gene_aware_test_similarities, original_normalize_gene_aware_test_labels, original_normalize_gene_aware_test_dists, original_normalize_gene_aware_test_quartiles, original_normalize_gene_aware_test_projections = evaluate_model(
+            esm_only_model_normalize, loss_fn, gene_aware_test_loader, device
+        )
+        original_normalize_gene_aware_test_acc, original_normalize_gene_aware_test_precision, original_normalize_gene_aware_test_recall, original_normalize_gene_aware_test_f1 = contrastive_metrics(original_normalize_gene_aware_test_similarities, original_normalize_gene_aware_test_labels)
+        original_normalize_gene_aware_test_auc = roc_auc_score(original_normalize_gene_aware_test_labels, original_normalize_gene_aware_test_similarities)
     else:
         original_normalize_test_loss = '-'
         original_normalize_test_similarities = '-'
@@ -1026,11 +1170,19 @@ def main():
         esm_only=True,
         normalize_to_wt=False
     ).to(device)
+    print('og esm embeddings evaluation - main batch type - not normalize to wt')
     original_test_loss, original_test_similarities, original_test_labels, original_test_dists, original_test_quartiles, original_test_projections = evaluate_model(
         esm_only_model_no_normalize, loss_fn, test_loader, device
     )
     original_test_acc, original_test_precision, original_test_recall, original_test_f1 = contrastive_metrics(original_test_similarities, original_test_labels)
     original_test_auc = roc_auc_score(original_test_labels, original_test_similarities)
+
+    print('og esm embeddings evaluation - gene-aware batch type - not normalize to wt')
+    original_gene_aware_test_loss, original_gene_aware_test_similarities, original_gene_aware_test_labels, original_gene_aware_test_dists, original_gene_aware_test_quartiles, original_gene_aware_test_projections = evaluate_model(
+        esm_only_model_no_normalize, loss_fn, gene_aware_test_loader, device
+    )
+    original_gene_aware_test_acc, original_gene_aware_test_precision, original_gene_aware_test_recall, original_gene_aware_test_f1 = contrastive_metrics(original_gene_aware_test_similarities, original_gene_aware_test_labels)
+    original_gene_aware_test_auc = roc_auc_score(original_gene_aware_test_labels, original_gene_aware_test_similarities)
 
 
     print(f"\nTest Metrics:")
@@ -1051,8 +1203,12 @@ def main():
 
     with open(RESULTS_FILE, 'a') as f:
         f.write(f'{RUN_NAME},{test_loss},{test_acc},{test_precision},{test_recall},{test_f1},{test_auc}\n')
+        f.write(f'{RUN_NAME}_gene_aware_eval,-,{gene_aware_test_acc},{gene_aware_test_precision},{gene_aware_test_recall},{gene_aware_test_f1},{gene_aware_test_auc}\n')
         f.write(f'{RUN_NAME}_og_esm_normalize,-,{original_normalize_test_acc},{original_normalize_test_precision},{original_normalize_test_recall},{original_normalize_test_f1},{original_normalize_test_auc}\n')
+        f.write(f'{RUN_NAME}_og_esm_normalize_gene_aware,-,{original_normalize_gene_aware_test_acc},{original_normalize_gene_aware_test_precision},{original_normalize_gene_aware_test_recall},{original_normalize_gene_aware_test_f1},{original_normalize_gene_aware_test_auc}\n')
         f.write(f'{RUN_NAME}_og_esm_no_normalize,-,{original_test_acc},{original_test_precision},{original_test_recall},{original_test_f1},{original_test_auc}\n')
+        f.write(f'{RUN_NAME}_og_esm_no_normalize_gene_aware,-,{original_gene_aware_test_acc},{original_gene_aware_test_precision},{original_gene_aware_test_recall},{original_gene_aware_test_f1},{original_gene_aware_test_auc}\n')
+
 
     print(f"\nDistance Statistics:")
     print(f"  Mean: {np.mean(final_dists):.4f}")

@@ -1,5 +1,6 @@
 *.pyc
 **/__pycache__
+esm-variants
 dms_data/embeddings/*
 !dms_data/embeddings/.gitkeep
 dms_data/datasets/*
