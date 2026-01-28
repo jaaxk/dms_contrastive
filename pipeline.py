@@ -927,10 +927,6 @@ def ohe_llr_baseline(loss_fn, dataloader, position_split=False):
         f.write(f'{RUN_NAME}_OHE+LLR_baseline_ridge_pos_split,-,{acc},{precision},{recall},{f1},-\n')
 
 
-
-
-        
-
 def get_ohe_features(wt_sequences, mutants):
     #to be used in DataLoader / collate_batch
 
@@ -978,6 +974,32 @@ def get_ohe_features(wt_sequences, mutants):
     #there will be NaNs if there are two mutated positions (A23Y:A27R), we need to remove these later to stay consistent with quartiles
     return ohe_features
 
+def llr_threshold_performance(test_loader):
+    #split-by-gene baseline evaluation using LLR score
+
+    test_llr = []
+    test_quartiles = []
+    for batch in tqdm(test_loader):
+        test_llr.extend(batch['ohe_features'][:, 0])
+        test_quartiles.extend(batch['quartiles'])
+
+    #remove nans
+    test_llr = np.array(test_llr)
+    nan_idx = np.isnan(test_llr)
+    test_llr = test_llr[~nan_idx]
+    test_quartiles = np.array(test_quartiles)[~nan_idx]
+    test_quartiles = [1 if q=='high' else 0 for q in test_quartiles]
+
+    auc = roc_auc_score(test_quartiles, test_llr)
+
+    with open(RESULTS_FILE, 'a') as f:
+        f.write(f'{RUN_NAME}_LLR_alone,-,-,-,-,-,{auc}\n')
+
+
+
+    
+
+    
 
 def train(projection_net, loss_fn, train_loader, test_loader, optimizer, device):
     
@@ -1167,6 +1189,7 @@ def main():
         train_loader = DataLoader(train_dataset, batch_size=BATCH_SIZE, gene_to_wt = gene_to_wt, shuffle=True, gene_aware=False)
         test_loader = DataLoader(test_dataset, batch_size=BATCH_SIZE, gene_to_wt = gene_to_wt, shuffle=False, gene_aware=False)
         gene_aware_test_loader = DataLoader(test_dataset, batch_size=BATCH_SIZE, gene_to_wt=gene_to_wt, shuffle=False, gene_aware=True)
+        gene_aware_train_loader = DataLoader(train_dataset, batch_size=BATCH_SIZE, gene_to_wt=gene_to_wt, shuffle=True, gene_aware=True)
 
 
     print(f"\n Data loaders created")
@@ -1209,6 +1232,7 @@ def main():
 
 
     if args.ohe_baseline:
+        llr_threshold_performance(gene_aware_test_loader)
         ohe_llr_baseline(loss_fn, gene_aware_test_loader)
         return
 
