@@ -15,7 +15,7 @@ EMBEDDING_LAYER="layer33_mean"
 for COARSE_SELECTION_TYPE in "Stability" "OrganismalFitness" "Activity" "Binding" "Expression" ; do
     echo "Running ${COARSE_SELECTION_TYPE} ${EMBEDDING_LAYER}"
 
-    RUN_NAME="650M_NORM_knn_${COARSE_SELECTION_TYPE}_${EMBEDDING_LAYER}"
+    RUN_NAME="650M_OHE+LLR_1_${COARSE_SELECTION_TYPE}_${EMBEDDING_LAYER}"
 
     python -u pipeline.py --run_name $RUN_NAME \
         --data_path $BASE_DATA_PATH/datasets/${COARSE_SELECTION_TYPE}.csv \
@@ -30,6 +30,9 @@ for COARSE_SELECTION_TYPE in "Stability" "OrganismalFitness" "Activity" "Binding
         --metadata_path $BASE_DATA_PATH/datasets/DMS_substitutions.csv \
         --num_epochs 10 \
         --normalize_to_wt \
-        --model_path /gpfs/scratch/jvaska/brandes_lab/results/650M_NORM_SAVE_${COARSE_SELECTION_TYPE}_layer33_mean/projection_head.pt
+        --model_path /gpfs/scratch/jvaska/brandes_lab/results/650M_NORM_SAVE_${COARSE_SELECTION_TYPE}_layer33_mean/projection_head.pt \
+        --ohe_baseline
 
 done
+
+#         --model_path /gpfs/scratch/jvaska/brandes_lab/results/650M_NORM_SAVE_${COARSE_SELECTION_TYPE}_layer33_mean/projection_head.pt

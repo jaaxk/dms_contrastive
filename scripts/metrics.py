@@ -3,6 +3,23 @@ from sklearn.cluster import KMeans
 from sklearn.linear_model import LogisticRegression
 import numpy as np
 from sklearn.neighbors import KNeighborsClassifier
+from sklearn.linear_model import RidgeClassifier
+
+
+def ridge_metrics(train_projections, train_quartiles, test_projections, test_quartiles):
+    ridge = RidgeClassifier()
+    test_quartiles = [1 if q == 'high' else 0 for q in test_quartiles]
+    train_quartiles = [1 if q == 'high' else 0 for q in train_quartiles]
+
+    ridge.fit(train_projections, train_quartiles)
+
+    predictions = ridge.predict(test_projections)
+    accuracy = accuracy_score(test_quartiles, predictions)
+    precision = precision_score(test_quartiles, predictions)
+    recall = recall_score(test_quartiles, predictions)
+    f1 = f1_score(test_quartiles, predictions)
+    
+    return accuracy, precision, recall, f1
 
 def knn_metrics(test_embeddings, test_quartiles, train_embeddings, train_quartiles):
     neigh = KNeighborsClassifier(n_neighbors=5)

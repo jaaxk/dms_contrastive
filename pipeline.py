@@ -32,7 +32,7 @@ import scripts.h5_utils as h5_utils
 import json
 import re
 from contextlib import redirect_stdout, redirect_stderr
-from scripts.metrics import contrastive_metrics, kmeans_metrics, logreg_metrics, knn_metrics
+from scripts.metrics import contrastive_metrics, kmeans_metrics, logreg_metrics, knn_metrics, ridge_metrics
 
 warnings.filterwarnings('ignore')
 
@@ -325,9 +325,11 @@ class DataLoader():
 
         if args.ohe_baseline and self.gene_aware:
             #print('gene-aware ohe batch iteration')
-            ohe_features = get_ohe_features(wt_sequences, [item['mutant'] for item in batch])
+            mutants = [item['mutant'] for item in batch]
+            ohe_features = get_ohe_features(wt_sequences, mutants)
         else:
             ohe_features = None
+            mutants = None
 
         embeddings = load_embeddings_h5(sequences)
 
@@ -338,7 +340,8 @@ class DataLoader():
             'genes': genes,
             'wt_embeddings': wt_embeddings,
             'embeddings': embeddings,
-            'ohe_features': ohe_features
+            'ohe_features': ohe_features,
+            'mutants': mutants
         }
 
     def __len__(self):
@@ -567,6 +570,8 @@ def create_train_test_split(df, split_by_gene=True, test_size=0.2):
         print("✅ No gene overlap between train and test - proper held-out test!")
     else:
         print(f"⚠️  Warning: {len(overlap)} genes overlap")
+        if args.split_by_gene:
+            raise ValueError("Gene overlap detected in gene-aware split")
 
     #verify no SEQUENCE overlap
     overlap = set(train_sequences).intersection(set(test_sequences))
@@ -574,6 +579,7 @@ def create_train_test_split(df, split_by_gene=True, test_size=0.2):
         print("✅ No sequence overlap between train and test - proper held-out test!")
     else:
         print(f"⚠️  Warning: {len(overlap)} sequences overlap")
+        raise ValueError("Sequence overlap detected in sequence-aware split")
 
     return train_df, test_df
 
@@ -757,7 +763,7 @@ def calc_esm_llr_scores(wt_seq):
             'esm_score': raw_seq_results['esm_score']}).set_index('mut_name')['esm_score']
 
 
-def ohe_llr_baseline(loss_fn, dataloader):
+def ohe_llr_baseline(loss_fn, dataloader, position_split=False):
     print("Calculating OHE LLR baseline")
 
     all_losses = []
@@ -765,9 +771,94 @@ def ohe_llr_baseline(loss_fn, dataloader):
     all_distances = []
     all_labels = []
 
+    gene_to_metrics = {'random_split': {}, 'positional_split': {}}
+    current_gene = None
+    
     for batch in tqdm(dataloader, desc="OHE LLR Baseline"):
         quartiles = batch['quartiles']
         ohe_features = batch['ohe_features']
+        mutants = batch['mutants']
+
+        assert len(set(batch['genes'])) == 1 #should only be used with gene-aware loader
+        gene = batch['genes'][0]
+        if gene != current_gene:
+            #evaluate last gene
+            if current_gene is not None:
+                #train/test split
+                #POSITIONAL SPLIT
+                MISSENSE_PATTERN = re.compile('([A-Z])(\d+)([A-Z])')
+                positions = []
+                for mut in gene_mutants:
+                    (ref_aa, pos, alt_aa), = MISSENSE_PATTERN.findall(mut)
+                    positions.append(int(pos))
+
+                unique_positions = list(set(positions))
+                np.random.shuffle(unique_positions)
+                train_positions = unique_positions[:int(len(unique_positions)*0.8)]
+                test_positions = unique_positions[int(len(unique_positions)*0.8):]
+
+                train_idx = []
+                test_idx = []
+                for i in range(len(gene_encodings)):
+                    if positions[i] in train_positions:
+                        train_idx.append(i)
+                    elif positions[i] in test_positions:
+                        test_idx.append(i)
+
+                train_encodings = [gene_encodings[i] for i in train_idx]
+                train_quartiles = [gene_quartiles[i] for i in train_idx]
+                train_similarities = [gene_similarities[i] for i in train_idx]
+                train_labels = [gene_labels[i] for i in train_idx]
+                
+                test_encodings = [gene_encodings[i] for i in test_idx]
+                test_quartiles = [gene_quartiles[i] for i in test_idx]
+                test_similarities = [gene_similarities[i] for i in test_idx]
+                test_labels = [gene_labels[i] for i in test_idx]
+
+                results = {'knn': [], 'ridge': []}
+                #knn eval:
+                accuracy, precision, recall, f1 = knn_metrics(test_encodings, test_quartiles, train_encodings, train_quartiles)
+                results['knn'] = [accuracy, precision, recall, f1]
+                #ridge eval:
+                accuracy, precision, recall, f1 = ridge_metrics(train_encodings, train_quartiles, test_encodings, test_quartiles)
+                results['ridge'] = [accuracy, precision, recall, f1]
+
+                gene_to_metrics['positional_split'][current_gene] = results
+
+
+                #RANDOM SPLIT 
+                indices = list(range(len(gene_encodings)))
+                np.random.shuffle(indices)
+                train_idx = indices[:int(len(indices)*0.8)]
+                test_idx = indices[int(len(indices)*0.8):]
+                
+                train_encodings = [gene_encodings[i] for i in train_idx]
+                train_quartiles = [gene_quartiles[i] for i in train_idx]
+                train_similarities = [gene_similarities[i] for i in train_idx]
+                train_labels = [gene_labels[i] for i in train_idx]
+                
+                test_encodings = [gene_encodings[i] for i in test_idx]
+                test_quartiles = [gene_quartiles[i] for i in test_idx]
+                test_similarities = [gene_similarities[i] for i in test_idx]
+                test_labels = [gene_labels[i] for i in test_idx]
+
+                results = {'knn': [], 'ridge': []}
+                #knn eval:
+                accuracy, precision, recall, f1 = knn_metrics(test_encodings, test_quartiles, train_encodings, train_quartiles)
+                results['knn'] = [accuracy, precision, recall, f1]
+                #ridge eval:
+                accuracy, precision, recall, f1 = ridge_metrics(train_encodings, train_quartiles, test_encodings, test_quartiles)
+                results['ridge'] = [accuracy, precision, recall, f1]
+
+                gene_to_metrics['random_split'][current_gene] = results
+                
+            #reset for next gene
+            current_gene = gene
+            gene_encodings = []
+            gene_similarities = []
+            gene_labels = []
+            gene_quartiles = []
+            gene_mutants = []
         #print(ohe_features)
         #print(ohe_features.shape)
         #print(type(ohe_features))
@@ -777,22 +868,67 @@ def ohe_llr_baseline(loss_fn, dataloader):
         #print(f"Removing {len(nan_idx)} features with nan values")
         ohe_features = np.delete(ohe_features, nan_idx, axis=0)
         quartiles = [quartiles[i] for i in range(len(quartiles)) if i not in nan_idx]
-        assert len(ohe_features) == len(quartiles)
+        mutants = [mutants[i] for i in range(len(mutants)) if i not in nan_idx]
+        assert len(ohe_features) == len(quartiles) == len(mutants)
+        gene_encodings.extend(ohe_features)
+        gene_quartiles.extend(quartiles)
+        gene_mutants.extend(mutants)
 
         loss, similarities, distances, labels = loss_fn(torch.tensor(ohe_features, dtype=torch.float32), quartiles)
+
+        gene_similarities.extend(similarities)
+        gene_labels.extend(labels)
         all_losses.append(loss.item())
         all_similarities.extend(similarities)
         all_distances.extend(distances)
         all_labels.extend(labels)
 
-    auc = roc_auc_score(all_labels, all_similarities)
+
+    #save to json
+    with open(f'{RESULTS_DIR}/ohe_llr_metrics.json', 'w') as f:
+        json.dump(gene_to_metrics, f)
+
     acc, precision, recall, f1 = contrastive_metrics(all_similarities, all_labels)
-
-    print(f"OHE LLR Baseline - Loss: {np.mean(all_losses):.4f}, AUC: {auc:.4f}, Acc: {acc:.4f}, Precision: {precision:.4f}, Recall: {recall:.4f}, F1: {f1:.4f}")
-
-
+    auc = roc_auc_score(all_labels, all_similarities)
     with open(RESULTS_FILE, 'a') as f:
         f.write(f'{RUN_NAME}_OHE+LLR_baseline,{np.mean(all_losses)},{acc},{precision},{recall},{f1},{auc}\n')
+    
+    
+    #average metrics across all genes - knn
+    #random split
+    acc = np.mean([gene_to_metrics['random_split'][gene]['knn'][0] for gene in gene_to_metrics['random_split']])
+    precision = np.mean([gene_to_metrics['random_split'][gene]['knn'][1] for gene in gene_to_metrics['random_split']])
+    recall = np.mean([gene_to_metrics['random_split'][gene]['knn'][2] for gene in gene_to_metrics['random_split']])
+    f1 = np.mean([gene_to_metrics['random_split'][gene]['knn'][3] for gene in gene_to_metrics['random_split']])
+    with open(RESULTS_FILE, 'a') as f:
+        f.write(f'{RUN_NAME}_OHE+LLR_baseline_knn_rand_split,-,{acc},{precision},{recall},{f1},-\n')
+    #positional split
+    acc = np.mean([gene_to_metrics['positional_split'][gene]['knn'][0] for gene in gene_to_metrics['positional_split']])
+    precision = np.mean([gene_to_metrics['positional_split'][gene]['knn'][1] for gene in gene_to_metrics['positional_split']])
+    recall = np.mean([gene_to_metrics['positional_split'][gene]['knn'][2] for gene in gene_to_metrics['positional_split']])
+    f1 = np.mean([gene_to_metrics['positional_split'][gene]['knn'][3] for gene in gene_to_metrics['positional_split']])
+    with open(RESULTS_FILE, 'a') as f:
+        f.write(f'{RUN_NAME}_OHE+LLR_baseline_knn_pos_split,-,{acc},{precision},{recall},{f1},-\n')
+
+    #ridge
+    #random split
+    acc = np.mean([gene_to_metrics['random_split'][gene]['ridge'][0] for gene in gene_to_metrics['random_split']])
+    precision = np.mean([gene_to_metrics['random_split'][gene]['ridge'][1] for gene in gene_to_metrics['random_split']])
+    recall = np.mean([gene_to_metrics['random_split'][gene]['ridge'][2] for gene in gene_to_metrics['random_split']])
+    f1 = np.mean([gene_to_metrics['random_split'][gene]['ridge'][3] for gene in gene_to_metrics['random_split']])
+    with open(RESULTS_FILE, 'a') as f:
+        f.write(f'{RUN_NAME}_OHE+LLR_baseline_ridge_rand_split,-,{acc},{precision},{recall},{f1},-\n')
+    #positional split
+    acc = np.mean([gene_to_metrics['positional_split'][gene]['ridge'][0] for gene in gene_to_metrics['positional_split']])
+    precision = np.mean([gene_to_metrics['positional_split'][gene]['ridge'][1] for gene in gene_to_metrics['positional_split']])
+    recall = np.mean([gene_to_metrics['positional_split'][gene]['ridge'][2] for gene in gene_to_metrics['positional_split']])
+    f1 = np.mean([gene_to_metrics['positional_split'][gene]['ridge'][3] for gene in gene_to_metrics['positional_split']])
+    with open(RESULTS_FILE, 'a') as f:
+        f.write(f'{RUN_NAME}_OHE+LLR_baseline_ridge_pos_split,-,{acc},{precision},{recall},{f1},-\n')
+
+
+
+
         
 
 def get_ohe_features(wt_sequences, mutants):
@@ -998,8 +1134,10 @@ def main():
     test_genes = test_df['filename'].tolist()
     if args.ohe_baseline:
         test_mutants = test_df['mutant'].tolist()
+        train_mutants = train_df['mutant'].tolist()
     else:
         test_mutants = None
+        train_mutants = None
 
     print(f'train seq length distribution: {pd.Series(train_seqs).str.len().describe()}')
     print(f'test seq length distribution: {pd.Series(test_seqs).str.len().describe()}')
@@ -1012,8 +1150,12 @@ def main():
     
 
     #create datasets
+    if args.split_by_gene:
+        assert set(train_genes).isdisjoint(set(test_genes))
+    else:
+        print('WARNING: NOT splitting train/test set by gene')
     train_dataset = DMSContrastiveDataset(train_seqs, train_quarts, train_dms,
-                                          train_genes)
+                                          train_genes, train_mutants)
     test_dataset = DMSContrastiveDataset(test_seqs, test_quarts, test_dms,
                                          test_genes, test_mutants)
 
@@ -1068,6 +1210,7 @@ def main():
 
     if args.ohe_baseline:
         ohe_llr_baseline(loss_fn, gene_aware_test_loader)
+        return
 
 
     if args.model_path is not None:
@@ -1204,8 +1347,7 @@ def main():
     visualize_embeddings_tsne(sample_embeddings, sample_dms,
                               f"Original ESM Layer {args.esm_layer} Embeddings (DMS Colored)")
 
-    with torch.no_grad():
-        projected_embeddings = projection_net(sample_seqs)
+    projected_embeddings = torch.tensor(test_projections)
 
     visualize_embeddings_tsne(projected_embeddings, sample_dms,
                               "Projected Embeddings (DMS Colored)")
