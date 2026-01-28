@@ -32,6 +32,7 @@ import scripts.h5_utils as h5_utils
 import json
 import re
 from contextlib import redirect_stdout, redirect_stderr
+from scripts.metrics import contrastive_metrics, kmeans_metrics, logreg_metrics, knn_metrics
 
 warnings.filterwarnings('ignore')
 
@@ -59,7 +60,7 @@ def parse_args():
     parser.add_argument('--normalize_output', type=bool, default=True)
     parser.add_argument('--freeze_esm', action='store_true', default=False)
     parser.add_argument('--esm_layer', type=int, default=33)
-    parser.add_argument('--model_name', default='facebook/esm2_t33_650M_UR50D')
+    parser.add_argument('--model_name', default='facebook/esm2_t33_650M_UR50D', help='ESM model name (start with facebook/)')
 
     #data
     parser.add_argument('--embeddings_path', default=None)
@@ -74,6 +75,7 @@ def parse_args():
     parser.add_argument('--metadata_path', default=None)
     parser.add_argument('--normalize_to_wt', action='store_true', default=False)
     parser.add_argument('--ohe_baseline', action='store_true', default=False)
+    parser.add_argument('--model_path', type=str, default=None, help='path to pre-trained PROJECTION HEAD')
 
     args = parser.parse_args()
     return args
@@ -112,13 +114,16 @@ if args.normalize_to_wt:
     if not args.metadata_path:
         raise ValueError("--metadata_path must be specified if --normalize_to_wt is set")
     
-
 #init ESM model
-esm_model = AutoModel.from_pretrained(args.model_name)
-tokenizer = AutoTokenizer.from_pretrained(args.model_name)
+if args.model_path is None:
+    esm_model = AutoModel.from_pretrained(args.model_name)
+    tokenizer = AutoTokenizer.from_pretrained(args.model_name)
+    esm_model.eval() #REMOVE once we are finetuning
+    esm_model.to(device)
+else:
+    esm_model = None
+    tokenizer = None
 
-esm_model.eval() #REMOVE once we are finetuning
-esm_model.to(device)
 
 if args.ohe_baseline:
     repo_path = os.path.abspath("/gpfs/scratch/jvaska/brandes_lab/esm-variants")
@@ -146,7 +151,7 @@ def set_seed(seed=42):
     torch.backends.cudnn.benchmark = False
     os.environ['PYTHONHASHSEED'] = str(seed)
 
-set_seed(42)  # Call this at the start of your script
+set_seed(42)
 
 def esm_batch(sequences):
     #rint('ESM BATCH METHOD')
@@ -340,13 +345,12 @@ class DataLoader():
         return len(self.indices) // self.batch_size
 
 class ContrastiveNetwork(nn.Module):
-    def __init__(self, esm_model, input_dim=1280, hidden_dims=[512, 256, 128], normalize_output=False, esm_layer=33, esm_only=False, normalize_to_wt=False):
+    def __init__(self, input_dim=1280, hidden_dims=[512, 256, 128], normalize_output=False, esm_layer=33, esm_only=False, normalize_to_wt=False):
         super(ContrastiveNetwork, self).__init__()
 
         if esm_layer != 33:
             raise ValueError('change forward method to output all hidden states')
-
-        self.esm = esm_model
+        
         self.esm_layer = esm_layer
         self.esm_only = esm_only
         self.normalize_to_wt = normalize_to_wt
@@ -658,59 +662,6 @@ def evaluate_model(projection_net, loss_fn, dataloader, device):
     avg_loss = total_loss / max(num_batches, 1)
     return avg_loss, all_similarities, all_labels, all_distances, all_quartiles, all_projections
 
-def contrastive_metrics(similarities, labels):
-    binary_preds = [1 if sim > 0.5 else 0 for sim in similarities]
-    accuracy = accuracy_score(labels, binary_preds)
-    precision = precision_score(labels, binary_preds)
-    recall = recall_score(labels, binary_preds)
-    f1 = f1_score(labels, binary_preds)
-    return accuracy, precision, recall, f1
-
-def kmeans_metrics(projections, quartiles, n_clusters=2):
-    kmeans = KMeans(n_clusters=n_clusters, random_state=42)
-    kmeans.fit(projections)
-    kmeans_labels = kmeans.labels_
-
-    quartiles = [1 if q == 'high' else 0 for q in quartiles]
-
-    accuracy = max(accuracy_score(quartiles, kmeans_labels), 1 - accuracy_score(quartiles, kmeans_labels))
-    precision = max(precision_score(quartiles, kmeans_labels), 1 - precision_score(quartiles, kmeans_labels))
-    recall = max(recall_score(quartiles, kmeans_labels), 1 - recall_score(quartiles, kmeans_labels))
-    f1 = max(f1_score(quartiles, kmeans_labels), 1 - f1_score(quartiles, kmeans_labels))
-
-    return accuracy, precision, recall, f1
-
-def logreg_metrics(train_projections, train_quartiles, test_projections, test_quartiles, sample_train=1000):
-    # Sample data for efficiency
-    if len(train_projections) > sample_train:
-        train_indices = np.random.choice(len(train_projections), sample_train, replace=False)
-        train_proj_sample = [train_projections[i] for i in train_indices]
-        train_quartile_sample = [train_quartiles[i] for i in train_indices]
-    else:
-        train_proj_sample = train_projections
-        train_quartile_sample = train_quartiles
-    
-    # Convert to numpy arrays
-    X_train = np.array(train_proj_sample)
-    y_train = np.array([1 if q == 'high' else 0 for q in train_quartile_sample])
-    
-    X_test = np.array(test_projections)
-    y_test = np.array([1 if q == 'high' else 0 for q in test_quartiles])
-    
-    # Train logistic regression
-    clf = LogisticRegression(random_state=42)
-    clf.fit(X_train, y_train)
-    
-    # Predictions
-    y_pred = clf.predict(X_test)
-    
-    # Metrics
-    accuracy = accuracy_score(y_test, y_pred)
-    precision = precision_score(y_test, y_pred)
-    recall = recall_score(y_test, y_pred)
-    f1 = f1_score(y_test, y_pred)
-    
-    return accuracy, precision, recall, f1
 
 def plot_training_metrics(train_losses, val_losses, train_aucs, val_aucs):
     fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(15, 5))
@@ -785,7 +736,7 @@ def visualize_embeddings_tsne(embeddings, labels, title="t-SNE Visualization"):
 
     #reduce dimensionality
     tsne = TSNE(n_components=2, random_state=42, perplexity=min(30, len(embeddings)-1))
-    embeddings_2d = tsne.fit_transform(embeddings)
+    embeddings_2d = tsne.fit_transform(embeddings.cpu().numpy())
 
     plt.figure(figsize=(10, 8))
     scatter = plt.scatter(embeddings_2d[:, 0], embeddings_2d[:, 1],
@@ -892,6 +843,107 @@ def get_ohe_features(wt_sequences, mutants):
     return ohe_features
 
 
+def train(projection_net, loss_fn, train_loader, test_loader, optimizer, device):
+    
+    train_losses = []
+    val_losses = []
+    train_accs = []
+    val_accs = []
+    train_aucs = []
+    val_aucs = []
+
+    best_val_loss = float('inf')
+    best_val_auc = float('-inf')
+    patience_counter = 0
+    best_model_state = None
+    
+    print(f"\n{'='*80}")
+    print("STARTING TRAINING")
+    print(f"{'='*80}\n")
+
+    for epoch in range(NUM_EPOCHS):
+        print(f"\nEpoch {epoch+1}/{NUM_EPOCHS}")
+        #train
+        train_loss, train_similarities, train_labels_epoch, train_dists, train_quartiles, train_projections = train_epoch(
+            projection_net, loss_fn, train_loader, optimizer, device
+        )
+
+        #eval
+        val_loss, val_similarities, val_labels_epoch, val_dists, val_quartiles, val_projections = evaluate_model(
+            projection_net, loss_fn, test_loader, device
+        )
+
+        #metrics
+        
+        #train_acc, train_precision, train_recall, train_f1 = kmeans_metrics(train_projections, train_quartiles, n_clusters=2)
+        #val_acc, val_precision, val_recall, val_f1 = kmeans_metrics(val_projections, val_quartiles, n_clusters=2)
+        #val_acc, val_precision, val_recall, val_f1 = logreg_metrics(train_projections, train_quartiles, val_projections, val_quartiles)
+
+        val_acc, val_precision, val_recall, val_f1 = contrastive_metrics(val_similarities, val_labels_epoch)
+        train_acc, train_precision, train_recall, train_f1 = contrastive_metrics(train_similarities, train_labels_epoch)
+        train_auc = roc_auc_score(train_labels_epoch, train_similarities)
+        val_auc = roc_auc_score(val_labels_epoch, val_similarities)
+
+        train_losses.append(train_loss)
+        val_losses.append(val_loss)
+        train_accs.append(train_acc)
+        val_accs.append(val_acc)
+        train_aucs.append(train_auc)
+        val_aucs.append(val_auc)
+
+        if val_auc > best_val_auc:
+            best_val_auc = val_auc
+            patience_counter = 0
+            best_model_state = projection_net.state_dict().copy()
+            best_optimizer_state = optimizer.state_dict().copy()
+            print(f" Epoch {epoch+1}: New best val auc: {best_val_auc:.4f}")
+        else:
+            patience_counter += 1
+
+        #if (epoch + 1) % 5 == 0:
+        print(f"Epoch {epoch+1}/{NUM_EPOCHS}")
+        print(f"  Train Loss: {train_loss:.4f}") #, Train Acc: {train_acc:.4f}")
+        print(f"  Val Loss: {val_loss:.4f}, Val Acc: {val_acc:.4f}")
+        print(f"  Patience: {patience_counter}/{PATIENCE}")
+        print(f"  Train AUC: {train_auc:.4f}, Val AUC: {val_auc:.4f}")
+        if USE_LEARNABLE:
+            print(f"  Alpha: {loss_fn.alpha.item():.4f}, Beta: {loss_fn.beta.item():.4f}")
+
+        if (epoch + 1) % 20 == 0:
+            print("\n=== Distance Clustering Analysis ===")
+            similar_mean, dissimilar_mean, separation = plot_distance_clustering(
+                train_dists, train_labels_epoch, f"Training - Epoch {epoch+1}", final=False
+            )
+            print(f"Separation: {separation:.4f}\n")
+
+        if patience_counter >= PATIENCE:
+            print(f"\n Early stopping at epoch {epoch+1}")
+            break
+
+    print("\n" + "="*80)
+    print("TRAINING COMPLETE")
+    print("="*80 + "\n")
+
+    print("\n=== Saving Model ===")
+    torch.save({
+        'model_state_dict': best_model_state,
+        'optimizer_state_dict': best_optimizer_state,
+        'train_losses': train_losses,
+        'val_losses': val_losses,
+        'config': {
+            'distance_metric': DISTANCE_METRIC,
+            'hidden_dims': HIDDEN_DIMS,
+            'learning_rate': LEARNING_RATE,
+            'best_val_auc': best_val_auc
+        }
+    }, f'{RESULTS_DIR}/projection_head.pt')
+    print(f" Model saved to '{RESULTS_DIR}/projection_head.pt'")
+
+    plot_training_metrics(train_losses, val_losses, train_aucs, val_aucs)
+
+    return best_model_state
+
+
 
         
         
@@ -993,7 +1045,6 @@ def main():
 
     #init model
     projection_net = ContrastiveNetwork(
-        esm_model=esm_model,
         input_dim=args.input_dim,
         hidden_dims=HIDDEN_DIMS,
         normalize_output=NORMALIZE_OUTPUT,
@@ -1018,102 +1069,32 @@ def main():
     if args.ohe_baseline:
         ohe_llr_baseline(loss_fn, gene_aware_test_loader)
 
-    #train loop
-    train_losses = []
-    val_losses = []
-    train_accs = []
-    val_accs = []
-    train_aucs = []
-    val_aucs = []
 
-    best_val_loss = float('inf')
-    best_val_auc = float('-inf')
-    patience_counter = 0
-    best_model_state = None
-    
-    print(f"\n{'='*80}")
-    print("STARTING TRAINING")
-    print(f"{'='*80}\n")
-
-    for epoch in range(NUM_EPOCHS):
-        print(f"\nEpoch {epoch+1}/{NUM_EPOCHS}")
-        #train
-        train_loss, train_similarities, train_labels_epoch, train_dists, train_quartiles, train_projections = train_epoch(
-            projection_net, loss_fn, train_loader, optimizer, device
-        )
-
-        #eval
-        val_loss, val_similarities, val_labels_epoch, val_dists, val_quartiles, val_projections = evaluate_model(
-            projection_net, loss_fn, test_loader, device
-        )
-
-        #metrics
-        
-        #train_acc, train_precision, train_recall, train_f1 = kmeans_metrics(train_projections, train_quartiles, n_clusters=2)
-        #val_acc, val_precision, val_recall, val_f1 = kmeans_metrics(val_projections, val_quartiles, n_clusters=2)
-        #val_acc, val_precision, val_recall, val_f1 = logreg_metrics(train_projections, train_quartiles, val_projections, val_quartiles)
-
-        val_acc, val_precision, val_recall, val_f1 = contrastive_metrics(val_similarities, val_labels_epoch)
-        train_acc, train_precision, train_recall, train_f1 = contrastive_metrics(train_similarities, train_labels_epoch)
-        train_auc = roc_auc_score(train_labels_epoch, train_similarities)
-        val_auc = roc_auc_score(val_labels_epoch, val_similarities)
-
-        train_losses.append(train_loss)
-        val_losses.append(val_loss)
-        train_accs.append(train_acc)
-        val_accs.append(val_acc)
-        train_aucs.append(train_auc)
-        val_aucs.append(val_auc)
-
-        if val_auc > best_val_auc:
-            best_val_auc = val_auc
-            patience_counter = 0
-            best_model_state = projection_net.state_dict().copy()
-            print(f" Epoch {epoch+1}: New best val auc: {best_val_auc:.4f}")
-        else:
-            patience_counter += 1
-
-        #if (epoch + 1) % 5 == 0:
-        print(f"Epoch {epoch+1}/{NUM_EPOCHS}")
-        print(f"  Train Loss: {train_loss:.4f}") #, Train Acc: {train_acc:.4f}")
-        print(f"  Val Loss: {val_loss:.4f}, Val Acc: {val_acc:.4f}")
-        print(f"  Patience: {patience_counter}/{PATIENCE}")
-        print(f"  Train AUC: {train_auc:.4f}, Val AUC: {val_auc:.4f}")
-        if USE_LEARNABLE:
-            print(f"  Alpha: {loss_fn.alpha.item():.4f}, Beta: {loss_fn.beta.item():.4f}")
-
-        if (epoch + 1) % 20 == 0:
-            print("\n=== Distance Clustering Analysis ===")
-            similar_mean, dissimilar_mean, separation = plot_distance_clustering(
-                train_dists, train_labels_epoch, f"Training - Epoch {epoch+1}", final=False
-            )
-            print(f"Separation: {separation:.4f}\n")
-
-        if patience_counter >= PATIENCE:
-            print(f"\n Early stopping at epoch {epoch+1}")
-            break
-
-    if best_model_state is not None:
+    if args.model_path is not None:
+        print(f"\n Loading model from {args.model_path}")
+        checkpoint = torch.load(args.model_path, map_location=device)
+        projection_net.load_state_dict(checkpoint['model_state_dict'])
+    else:
+        best_model_state = train(projection_net, loss_fn, train_loader, test_loader, optimizer, device)
         print("\n Restoring best model...")
         projection_net.load_state_dict(best_model_state)
-
-    print("\n" + "="*80)
-    print("TRAINING COMPLETE")
-    print("="*80 + "\n")
-
-    plot_training_metrics(train_losses, val_losses, train_aucs, val_aucs)
 
     print("\n=== FINAL EVALUATION ===")
 
     #different-gene batch evaluation
     print('main batch evaluation')
-    final_loss, final_similarities, final_labels, final_dists, final_quartiles, final_projections = evaluate_model(
+    test_loss, test_similarities, test_labels, test_dists, test_quartiles, test_projections = evaluate_model(
         projection_net, loss_fn, test_loader, device
     )
-    test_loss = final_loss
-    test_acc, test_precision, test_recall, test_f1 = contrastive_metrics(final_similarities, final_labels)
-    test_auc = roc_auc_score(final_labels, final_similarities) #auc based on similarities
+    train_loss, train_similarities, train_labels, train_dists, train_quartiles, train_projections = evaluate_model(
+        projection_net, loss_fn, train_loader, device
+    )
+    #test_acc, test_precision, test_recall, test_f1 = contrastive_metrics(test_similarities, test_labels)
+    knn_acc, knn_precision, knn_recall, knn_f1 = knn_metrics(train_projections, train_quartiles, test_projections, test_quartiles)
 
+    test_auc = roc_auc_score(test_labels, test_similarities) #auc based on similarities
+
+    """
     #Gene-aware evaluation
     print('gene-aware batch evaluation')
     gene_aware_final_loss, gene_aware_final_similarities, gene_aware_final_labels, gene_aware_final_dists, gene_aware_final_quartiles, gene_aware_final_projections = evaluate_model(
@@ -1125,7 +1106,6 @@ def main():
     #original ESM evaluation - normalize to wt
     if args.normalize_to_wt:
         esm_only_model_normalize = ContrastiveNetwork(
-            esm_model=esm_model,
             input_dim=args.input_dim,
             hidden_dims=HIDDEN_DIMS,
             normalize_output=NORMALIZE_OUTPUT,
@@ -1162,7 +1142,6 @@ def main():
 
     #otiginal ESM eval - NOT normalizing to wt
     esm_only_model_no_normalize = ContrastiveNetwork(
-        esm_model=esm_model,
         input_dim=args.input_dim,
         hidden_dims=HIDDEN_DIMS,
         normalize_output=NORMALIZE_OUTPUT,
@@ -1184,40 +1163,34 @@ def main():
     original_gene_aware_test_acc, original_gene_aware_test_precision, original_gene_aware_test_recall, original_gene_aware_test_f1 = contrastive_metrics(original_gene_aware_test_similarities, original_gene_aware_test_labels)
     original_gene_aware_test_auc = roc_auc_score(original_gene_aware_test_labels, original_gene_aware_test_similarities)
 
-
+    """
     print(f"\nTest Metrics:")
-    print(f"  Loss: {test_loss:.4f}")
-    print(f"  Accuracy: {test_acc:.4f}")
-    print(f"  Precision: {test_precision:.4f}")
-    print(f"  Recall: {test_recall:.4f}")
-    print(f"  F1: {test_f1:.4f}")
+    #print(f"  Loss: {test_loss:.4f}")
+    print(f"  Accuracy: {knn_acc:.4f}")
+    print(f"  Precision: {knn_precision:.4f}")
+    print(f"  Recall: {knn_recall:.4f}")
+    print(f"  F1: {knn_f1:.4f}")
     print(f"  AUC: {test_auc:.4f}")
-    
-    #original_acc, original_precision, original_recall, original_f1 = logreg_metrics(train_dataset.embeddings, train_dataset.quartiles, test_dataset.embeddings, test_dataset.quartiles)
-    
-    #print(f"\nOriginal Dataset Metrics:")
-    #print(f"  Accuracy: {original_acc:.4f}")
-    #print(f"  Precision: {original_precision:.4f}")
-    #print(f"  Recall: {original_recall:.4f}")
-    #print(f"  F1: {original_f1:.4f}")
+
+
 
     with open(RESULTS_FILE, 'a') as f:
-        f.write(f'{RUN_NAME},{test_loss},{test_acc},{test_precision},{test_recall},{test_f1},{test_auc}\n')
-        f.write(f'{RUN_NAME}_gene_aware_eval,-,{gene_aware_test_acc},{gene_aware_test_precision},{gene_aware_test_recall},{gene_aware_test_f1},{gene_aware_test_auc}\n')
-        f.write(f'{RUN_NAME}_og_esm_normalize,-,{original_normalize_test_acc},{original_normalize_test_precision},{original_normalize_test_recall},{original_normalize_test_f1},{original_normalize_test_auc}\n')
-        f.write(f'{RUN_NAME}_og_esm_normalize_gene_aware,-,{original_normalize_gene_aware_test_acc},{original_normalize_gene_aware_test_precision},{original_normalize_gene_aware_test_recall},{original_normalize_gene_aware_test_f1},{original_normalize_gene_aware_test_auc}\n')
-        f.write(f'{RUN_NAME}_og_esm_no_normalize,-,{original_test_acc},{original_test_precision},{original_test_recall},{original_test_f1},{original_test_auc}\n')
-        f.write(f'{RUN_NAME}_og_esm_no_normalize_gene_aware,-,{original_gene_aware_test_acc},{original_gene_aware_test_precision},{original_gene_aware_test_recall},{original_gene_aware_test_f1},{original_gene_aware_test_auc}\n')
+        f.write(f'{RUN_NAME},{knn_acc},{knn_precision},{knn_recall},{knn_f1},{test_auc}\n')
+        #f.write(f'{RUN_NAME}_gene_aware_eval,-,{gene_aware_test_acc},{gene_aware_test_precision},{gene_aware_test_recall},{gene_aware_test_f1},{gene_aware_test_auc}\n')
+        #f.write(f'{RUN_NAME}_og_esm_normalize,-,{original_normalize_test_acc},{original_normalize_test_precision},{original_normalize_test_recall},{original_normalize_test_f1},{original_normalize_test_auc}\n')
+        #f.write(f'{RUN_NAME}_og_esm_normalize_gene_aware,-,{original_normalize_gene_aware_test_acc},{original_normalize_gene_aware_test_precision},{original_normalize_gene_aware_test_recall},{original_normalize_gene_aware_test_f1},{original_normalize_gene_aware_test_auc}\n')
+        #f.write(f'{RUN_NAME}_og_esm_no_normalize,-,{original_test_acc},{original_test_precision},{original_test_recall},{original_test_f1},{original_test_auc}\n')
+        #f.write(f'{RUN_NAME}_og_esm_no_normalize_gene_aware,-,{original_gene_aware_test_acc},{original_gene_aware_test_precision},{original_gene_aware_test_recall},{original_gene_aware_test_f1},{original_gene_aware_test_auc}\n')
 
 
     print(f"\nDistance Statistics:")
-    print(f"  Mean: {np.mean(final_dists):.4f}")
-    print(f"  Std: {np.std(final_dists):.4f}")
-    print(f"  Min: {np.min(final_dists):.4f}")
-    print(f"  Max: {np.max(final_dists):.4f}")
+    print(f"  Mean: {np.mean(test_dists):.4f}")
+    print(f"  Std: {np.std(test_dists):.4f}")
+    print(f"  Min: {np.min(test_dists):.4f}")
+    print(f"  Max: {np.max(test_dists):.4f}")
 
     print("\n=== Final Distance Clustering ===")
-    plot_distance_clustering(final_dists, final_labels, "Final Test Set", final=True)
+    plot_distance_clustering(test_dists, test_labels, "Final Test Set", final=True)
 
     print("\n=== Embedding Visualization ===")
     sample_size = min(500, len(test_seqs))
@@ -1226,7 +1199,7 @@ def main():
     sample_seqs = [test_seqs[i] for i in sample_indices]
     sample_dms = [test_dms[i] for i in sample_indices]
 
-    sample_embeddings = h5_utils.load_embeddings(args.embeddings_path, sample_seqs)
+    sample_embeddings = load_embeddings_h5(sample_seqs)
 
     visualize_embeddings_tsne(sample_embeddings, sample_dms,
                               f"Original ESM Layer {args.esm_layer} Embeddings (DMS Colored)")
@@ -1237,23 +1210,10 @@ def main():
     visualize_embeddings_tsne(projected_embeddings, sample_dms,
                               "Projected Embeddings (DMS Colored)")
 
-    print("\n=== Saving Model ===")
-    torch.save({
-        'model_state_dict': projection_net.state_dict(),
-        'optimizer_state_dict': optimizer.state_dict(),
-        'train_losses': train_losses,
-        'val_losses': val_losses,
-        'config': {
-            'distance_metric': DISTANCE_METRIC,
-            'hidden_dims': HIDDEN_DIMS,
-            'learning_rate': LEARNING_RATE,
-            'best_val_loss': best_val_loss
-        }
-    }, f'{RESULTS_DIR}/{RUN_NAME}.pt')
-    print(f" Model saved to '{RESULTS_DIR}/{RUN_NAME}.pt'")
     h5_utils.close_h5()
 
-main()
+if __name__ == '__main__':
+    main()
 
 print('Pipeline completed successfully')
 
