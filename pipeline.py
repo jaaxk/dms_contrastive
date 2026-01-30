@@ -807,13 +807,13 @@ def ohe_llr_baseline(loss_fn, dataloader, position_split=False):
 
                 train_encodings = [gene_encodings[i] for i in train_idx]
                 train_quartiles = [gene_quartiles[i] for i in train_idx]
-                train_similarities = [gene_similarities[i] for i in train_idx]
-                train_labels = [gene_labels[i] for i in train_idx]
+                #train_similarities = [gene_similarities[i] for i in train_idx]
+                #train_labels = [gene_labels[i] for i in train_idx]
                 
                 test_encodings = [gene_encodings[i] for i in test_idx]
                 test_quartiles = [gene_quartiles[i] for i in test_idx]
-                test_similarities = [gene_similarities[i] for i in test_idx]
-                test_labels = [gene_labels[i] for i in test_idx]
+                #test_similarities = [gene_similarities[i] for i in test_idx]
+                #test_labels = [gene_labels[i] for i in test_idx]
 
                 results = {'knn': [], 'ridge': []}
                 #knn eval:
@@ -834,13 +834,13 @@ def ohe_llr_baseline(loss_fn, dataloader, position_split=False):
                 
                 train_encodings = [gene_encodings[i] for i in train_idx]
                 train_quartiles = [gene_quartiles[i] for i in train_idx]
-                train_similarities = [gene_similarities[i] for i in train_idx]
-                train_labels = [gene_labels[i] for i in train_idx]
+                #train_similarities = [gene_similarities[i] for i in train_idx]
+                #train_labels = [gene_labels[i] for i in train_idx]
                 
                 test_encodings = [gene_encodings[i] for i in test_idx]
                 test_quartiles = [gene_quartiles[i] for i in test_idx]
-                test_similarities = [gene_similarities[i] for i in test_idx]
-                test_labels = [gene_labels[i] for i in test_idx]
+                #test_similarities = [gene_similarities[i] for i in test_idx]
+                #test_labels = [gene_labels[i] for i in test_idx]
 
                 results = {'knn': [], 'ridge': []}
                 #knn eval:
@@ -855,8 +855,8 @@ def ohe_llr_baseline(loss_fn, dataloader, position_split=False):
             #reset for next gene
             current_gene = gene
             gene_encodings = []
-            gene_similarities = []
-            gene_labels = []
+            #gene_similarities = []
+            #gene_labels = []
             gene_quartiles = []
             gene_mutants = []
         #print(ohe_features)
@@ -876,8 +876,8 @@ def ohe_llr_baseline(loss_fn, dataloader, position_split=False):
 
         loss, similarities, distances, labels = loss_fn(torch.tensor(ohe_features, dtype=torch.float32), quartiles)
 
-        gene_similarities.extend(similarities)
-        gene_labels.extend(labels)
+        #gene_similarities.extend(similarities)
+        #gene_labels.extend(labels)
         all_losses.append(loss.item())
         all_similarities.extend(similarities)
         all_distances.extend(distances)
@@ -1232,7 +1232,7 @@ def main():
 
 
     if args.ohe_baseline:
-        llr_threshold_performance(gene_aware_test_loader)
+        #llr_threshold_performance(gene_aware_test_loader)
         ohe_llr_baseline(loss_fn, gene_aware_test_loader)
         return
 

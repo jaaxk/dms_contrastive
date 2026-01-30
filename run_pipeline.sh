@@ -12,7 +12,7 @@ BASE_DATA_PATH="/gpfs/scratch/jvaska/brandes_lab/dms_data"
 
 EMBEDDING_LAYER="layer33_mean"
 
-for COARSE_SELECTION_TYPE in "Stability" "OrganismalFitness" "Activity" "Binding" "Expression" ; do
+for COARSE_SELECTION_TYPE in "Binding" ; do
     echo "Running ${COARSE_SELECTION_TYPE} ${EMBEDDING_LAYER}"
 
     RUN_NAME="650M_OHE+LLR_1_${COARSE_SELECTION_TYPE}_${EMBEDDING_LAYER}"
@@ -36,3 +36,4 @@ for COARSE_SELECTION_TYPE in "Stability" "OrganismalFitness" "Activity" "Binding
 done
 
 #         --model_path /gpfs/scratch/jvaska/brandes_lab/results/650M_NORM_SAVE_${COARSE_SELECTION_TYPE}_layer33_mean/projection_head.pt
+# "Stability" "OrganismalFitness" "Activity" "Binding" "Expression"
