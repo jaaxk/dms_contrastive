@@ -76,6 +76,7 @@ def parse_args():
     parser.add_argument('--normalize_to_wt', action='store_true', default=False)
     parser.add_argument('--ohe_baseline', action='store_true', default=False)
     parser.add_argument('--model_path', type=str, default=None, help='path to pre-trained PROJECTION HEAD')
+    parser.add_argument('--esm_variants_module_path', default='/gpfs/home/jv2807/dms_contrastive/esm-variants')
 
     args = parser.parse_args()
     return args
@@ -126,9 +127,9 @@ else:
 
 
 if args.ohe_baseline:
-    repo_path = os.path.abspath("/gpfs/scratch/jvaska/brandes_lab/esm-variants")
+    repo_path = os.path.abspath(args.esm_variants_module_path)
     if not os.path.exists(repo_path):
-        raise ValueError(f"ESM-variants repository not found at {repo_path}")
+        raise ValueError(f"ESM-variants repository not found at {repo_path}, run 'git clone https://github.com/ntranoslab/esm-variants , then set --esm_variants_module_path to the repo.")
     sys.path.append(repo_path)
     import esm_variants_utils
 
@@ -994,12 +995,7 @@ def llr_threshold_performance(test_loader):
 
     with open(RESULTS_FILE, 'a') as f:
         f.write(f'{RUN_NAME}_LLR_alone,-,-,-,-,-,{auc}\n')
-
-
-
-    
-
-    
+ 
 
 def train(projection_net, loss_fn, train_loader, test_loader, optimizer, device):
     
