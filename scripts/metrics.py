@@ -4,6 +4,7 @@ from sklearn.linear_model import LogisticRegression
 import numpy as np
 from sklearn.neighbors import KNeighborsClassifier
 from sklearn.linear_model import RidgeClassifier
+from sklearn.metrics import roc_auc_score
 
 
 def ridge_metrics(train_projections, train_quartiles, test_projections, test_quartiles):
@@ -18,10 +19,17 @@ def ridge_metrics(train_projections, train_quartiles, test_projections, test_qua
     precision = precision_score(test_quartiles, predictions)
     recall = recall_score(test_quartiles, predictions)
     f1 = f1_score(test_quartiles, predictions)
+
+    # Compute AUC
+    probs = ridge.decision_function(test_projections)
+    auc = roc_auc_score(test_quartiles, probs)
     
-    return accuracy, precision, recall, f1
+    return accuracy, precision, recall, f1, auc
 
 def knn_metrics(test_embeddings, test_quartiles, train_embeddings, train_quartiles):
+    if len(train_embeddings) < 5:
+        #print("WARNING: Not enough data to train KNN, returning None for all metrics.")
+        return None, None, None, None, None  # Not enough data to train KNN
     neigh = KNeighborsClassifier(n_neighbors=5)
     test_quartiles = [1 if q == 'high' else 0 for q in test_quartiles]
     train_quartiles = [1 if q == 'high' else 0 for q in train_quartiles]
@@ -32,8 +40,11 @@ def knn_metrics(test_embeddings, test_quartiles, train_embeddings, train_quartil
     precision = precision_score(test_quartiles, predictions)
     recall = recall_score(test_quartiles, predictions)
     f1 = f1_score(test_quartiles, predictions)
+
+    probs = neigh.predict_proba(test_embeddings)
+    auc = roc_auc_score(test_quartiles, probs[:, 1])  # Use probabilities for the positive class
     
-    return accuracy, precision, recall, f1
+    return accuracy, precision, recall, f1, auc
 
 def contrastive_metrics(similarities, labels):
     binary_preds = [1 if sim > 0.5 else 0 for sim in similarities]
