@@ -3,8 +3,8 @@
 #SBATCH --gres=gpu:1
 #SBATCH --time=48:00:00
 #SBATCH --mem=250G
-#SBATCH --output=logs/%j.out
-#SBATCH --job-name=dms_cl
+#SBATCH --output=logs/%j_sp.out
+#SBATCH --job-name=dms_cl_sp
 
 module load python/gpu/3.10.6-cuda12.9
 source venv/bin/activate
@@ -16,7 +16,7 @@ EMBEDDING_LAYER="layer33_mean"
 for COARSE_SELECTION_TYPE in "Stability" "OrganismalFitness" "Activity" "Binding" "Expression" ; do
     echo "Running ${COARSE_SELECTION_TYPE} ${EMBEDDING_LAYER}"
 
-    RUN_NAME="650M_NWT_savesplit_${COARSE_SELECTION_TYPE}_${EMBEDDING_LAYER}"
+    RUN_NAME="650M_NWT_splitbyposition_${COARSE_SELECTION_TYPE}_${EMBEDDING_LAYER}"
 
     python -u pipeline.py --run_name $RUN_NAME \
         --data_path $BASE_DATA_PATH/datasets/${COARSE_SELECTION_TYPE}.csv \
@@ -33,7 +33,7 @@ for COARSE_SELECTION_TYPE in "Stability" "OrganismalFitness" "Activity" "Binding
         --num_epochs 10 \
         --normalize_to_wt \
         --ohe_baseline \
-        --split_by_gene
+        --split_by_position
 
 done
 
