@@ -552,7 +552,7 @@ def load_and_preprocess_data(data_path):
     return combined_df
 
 def create_train_test_split(df, split_by_gene=True, split_by_position=None, test_size=0.2):
-    print("\nCreating gene-aware train/test split...")
+    print("\nCreating train/test split...")
 
     #get unique sequences
     all_sequences = df['mutated_sequence'].unique()
@@ -614,26 +614,30 @@ def create_train_test_split(df, split_by_gene=True, split_by_position=None, test
             for gene in all_genes:
                 gene_df = df[df['uniprot_id'] == gene]
                 positions = []
-                for mut in gene_df['mutant']:
+                position_indices = []
+                for i, mut in enumerate(gene_df['mutant']):
                     matches = MISSENSE_PATTERN.findall(mut)
                     if not matches:
                         continue
                     ref_aa, pos, alt_aa = matches[0] #only get first one if there are multiple
                     positions.append(int(pos))
+                    position_indices.append(i)
 
                 unique_positions = list(set(positions))
                 np.random.shuffle(unique_positions)
                 train_positions = unique_positions[:int(len(unique_positions)*(1.0 - test_size))]
                 test_positions = unique_positions[int(len(unique_positions)*(1.0 - test_size)):]
 
-                for i, seq in enumerate(gene_df['mutated_sequence']):
-                    if positions[i] in train_positions:
+                
+                for idx_in_positions, row_idx in enumerate(position_indices):
+                    seq = gene_df['mutated_sequence'].iloc[row_idx]
+                    pos = positions[idx_in_positions]
+                    
+                    if pos in train_positions:
                         train_sequences.append(seq)
-                    elif positions[i] in test_positions:
+                    elif pos in test_positions:
                         test_sequences.append(seq)
-                if len(train_sequences) == 0 or len(test_sequences) == 0:
-                    print(f"Skipping gene {gene} for random split due to insufficient data after sampling")
-                    continue
+    
            
             train_df = df[df['mutated_sequence'].isin(train_sequences)].copy()
             test_df = df[df['mutated_sequence'].isin(test_sequences)].copy()
