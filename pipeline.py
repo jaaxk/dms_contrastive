@@ -54,6 +54,7 @@ def parse_args():
     parser.add_argument('--patience', type=int, default=50)
     parser.add_argument('--distance_metric', choices=['cosine', 'euclidean'], default='cosine')
     parser.add_argument('--use_learnable', type=bool, default=False)
+    parser.add_argument('--gradient_accumulation_steps', type=int, default=1, help='Number of steps to accumulate gradients for before updating model weights')
 
     #model hyperparams
     parser.add_argument('--hidden_dims', type=list, default=[512, 256, 128])
@@ -615,7 +616,14 @@ def create_train_test_split(df, split_by_gene=True, split_by_position=None, test
             test_genes = np.array(split_to_genes['test'])
         else:
             print('WARNING: Not using pre-defined gene split file - creating new random split')
-            train_genes, test_genes = train_test_split(all_genes, test_size=test_size, random_state=42)
+            good_split = False #we need to ensure we have more train seqs than test seqs. sometimes splitting by gene will give larger genes to test set, especially with small number of genes.
+            while not good_split:
+                train_genes, test_genes = train_test_split(all_genes, test_size=test_size, random_state=42)
+                train_seqs = len(df[df['uniprot_id'].isin(train_genes)])
+                test_seqs = len(df[df['uniprot_id'].isin(test_genes)])
+                if test_seqs < train_seqs:
+                    good_split = True
+
             split_to_genes = {'train': train_genes.tolist(), 'test': test_genes.tolist()}
             with open(f'{RESULTS_DIR}/data_split.json', 'w') as f:
                 json.dump(split_to_genes, f)
@@ -1361,11 +1369,11 @@ def train(projection_net, loss_fn, train_loader, test_loader, optimizer, device)
         train_quartiles = []
         num_batches = 0
 
-        for batch in tqdm(train_loader, desc="Training"):
-            global_step += 1
-            optimizer.zero_grad()
-            if esm_optimizer is not None:
-                esm_optimizer.zero_grad()
+        for batch_idx, batch in enumerate(tqdm(train_loader, desc="Training")):
+            if batch_idx % args.gradient_accumulation_steps == 0:
+                optimizer.zero_grad()
+                if esm_optimizer is not None:
+                    esm_optimizer.zero_grad()
 
             #sequences = batch['sequences']
             quartiles = batch['quartiles']
@@ -1377,11 +1385,17 @@ def train(projection_net, loss_fn, train_loader, test_loader, optimizer, device)
             #compute loss
             loss, similarities, distances, labels = loss_fn(projected, quartiles)
 
+            loss = loss / args.gradient_accumulation_steps  # Normalize loss for gradient accumulation
+
             #backward pass
             loss.backward()
-            optimizer.step()
-            if esm_optimizer is not None:
-                esm_optimizer.step()
+
+            if (batch_idx + 1) % args.gradient_accumulation_steps == 0:
+                optimizer.step()
+                if esm_optimizer is not None:
+                    esm_optimizer.step()
+                
+                global_step += 1
 
             total_loss += loss.item()
             num_batches += 1
@@ -1437,7 +1451,7 @@ def train(projection_net, loss_fn, train_loader, test_loader, optimizer, device)
 
         #if (epoch + 1) % 5 == 0:
         print(f"Epoch {epoch+1}/{NUM_EPOCHS}")
-        print(f"  Train Loss: {train_loss:.4f}") #, Train Acc: {train_acc:.4f}")
+        print(f"  Train Loss: {total_loss / num_batches:.4f}") #, Train Acc: {train_acc:.4f}")
         print(f"  Val Loss: {val_loss:.4f}, Val Acc: {val_acc:.4f}")
         print(f"  Patience: {patience_counter}/{PATIENCE}")
         print(f"  Train AUC: {train_auc:.4f}, Val AUC: {val_auc:.4f}")
