@@ -18,7 +18,6 @@ import seaborn as sns
 from sklearn.manifold import TSNE
 from sklearn.metrics import accuracy_score, precision_score, recall_score, f1_score, roc_auc_score, roc_curve
 from sklearn.model_selection import train_test_split
-from sklearn.cluster import KMeans
 from sklearn.linear_model import LogisticRegression
 import warnings
 import sys
@@ -33,6 +32,7 @@ import json
 import re
 from contextlib import redirect_stdout, redirect_stderr
 from scripts.metrics import contrastive_metrics, kmeans_metrics, logreg_metrics, knn_metrics, ridge_metrics
+import wandb
 
 warnings.filterwarnings('ignore')
 
@@ -94,6 +94,11 @@ def parse_args():
                         help='Target modules for LoRA')
     parser.add_argument('--esm_lr', type=float, default=0.00005, 
                         help='Learning rate for ESM LoRA adapter')
+
+    #wandb args
+    parser.add_argument('--wandb_project', type=str, default='dms-contrastive', help='Weights and Biases project name')
+    parser.add_argument('--wandb_entity', type=str, default='jack-vaska-nyu-langone-health', help='Weights and Biases entity name')
+    parser.add_argument('--eval_steps', type=int, default=700, help='Save model and eval metrics every N steps (batches)')
 
     args = parser.parse_args()
     print(args)
@@ -182,6 +187,7 @@ elif args.split_file is not None:
     DATA_SPLIT_PATH = args.split_file
 else:
     DATA_SPLIT_PATH = None
+
 
 # Set all random seeds for reproducibility
 def set_seed(seed=42):
@@ -745,58 +751,12 @@ def get_embeddings_from_model(projection_net, dataloader, device):
     
     return all_projections
 
-def train_epoch(projection_net, loss_fn, dataloader, optimizer, device, esm_optimizer=None):
-    projection_net.train()
-    if args.use_lora and esm_model is not None:
-        esm_model.train()
-
-
-    total_loss = 0
-    all_similarities = []
-    all_labels = []
-    all_distances = []
-    all_projections = []
-    all_quartiles = []
-    num_batches = 0
-
-    for batch in tqdm(dataloader, desc="Training"):
-        optimizer.zero_grad()
-        if esm_optimizer is not None:
-            esm_optimizer.zero_grad()
-
-        #sequences = batch['sequences']
-        quartiles = batch['quartiles']
-
-        #project embeddings
-        projected = projection_net(batch)
-        all_projections.extend(projected.cpu().detach().numpy())
-
-        #compute loss
-        loss, similarities, distances, labels = loss_fn(projected, quartiles)
-
-        #backward pass
-        loss.backward()
-        optimizer.step()
-        if esm_optimizer is not None:
-            esm_optimizer.step()
-
-        total_loss += loss.item()
-        num_batches += 1
-
-        all_similarities.extend(similarities)
-        all_distances.extend(distances)
-        all_labels.extend(labels)
-        all_quartiles.extend(quartiles)
-
-    return total_loss / max(num_batches, 1), all_similarities, all_labels, all_distances, all_quartiles, all_projections
-
 def evaluate_model(projection_net, loss_fn, dataloader, device):
     projection_net.eval()
 
     all_similarities = []
     all_labels = []
     all_distances = []
-    all_kmeans_labels = []
     all_quartiles = []
     all_projections = []
     total_loss = 0
@@ -1155,6 +1115,7 @@ def ohe_llr_baseline(batches, projection_net, train_size=None):
 def classification_comparison_by_train_size(projection_net, dataloader, device, num_bootstraps=10, train_sizes=[.05, .1, .2, .4, .6, .8]):
     #run classification comparison at different train sizes for OHE+LLR baseline vs learned projections
     #then plot performance vs train size
+    #dataloader must NOT be shuffled and MUST be gene-aware
     from scipy import stats
 
     plot_dir = f'{RESULTS_DIR}/train_size_plots'
@@ -1357,6 +1318,9 @@ def train(projection_net, loss_fn, train_loader, test_loader, optimizer, device)
     optimizer is for projection_net
     Create separate optimizer for ESM LoRA if needed
     """
+
+    #Weights and Biases tracking:
+    run = wandb.init(project=args.wandb_project, name=RUN_NAME, entity=args.wandb_entity, config=args.__dict__)
     
     train_losses = []
     val_losses = []
@@ -1367,6 +1331,7 @@ def train(projection_net, loss_fn, train_loader, test_loader, optimizer, device)
 
     best_val_loss = float('inf')
     best_val_auc = float('-inf')
+    global_step = 0
     patience_counter = 0
     best_model_state = None
     best_esm_state = None
@@ -1383,44 +1348,92 @@ def train(projection_net, loss_fn, train_loader, test_loader, optimizer, device)
     for epoch in range(NUM_EPOCHS):
         print(f"\nEpoch {epoch+1}/{NUM_EPOCHS}")
         #train
-        train_loss, train_similarities, train_labels_epoch, train_dists, train_quartiles, train_projections = train_epoch(
-            projection_net, loss_fn, train_loader, optimizer, device, esm_optimizer=esm_optimizer
-        )
+        projection_net.train()
+        if args.use_lora and esm_model is not None:
+            esm_model.train()
 
-        #eval
-        val_loss, val_similarities, val_labels_epoch, val_dists, val_quartiles, val_projections = evaluate_model(
-            projection_net, loss_fn, test_loader, device
-        )
 
-        #metrics
-        
-        #train_acc, train_precision, train_recall, train_f1 = kmeans_metrics(train_projections, train_quartiles, n_clusters=2)
-        #val_acc, val_precision, val_recall, val_f1 = kmeans_metrics(val_projections, val_quartiles, n_clusters=2)
-        #val_acc, val_precision, val_recall, val_f1 = logreg_metrics(train_projections, train_quartiles, val_projections, val_quartiles)
+        total_loss = 0
+        train_similarities = []
+        train_labels = []
+        train_distances = []
+        train_projections = []
+        train_quartiles = []
+        num_batches = 0
 
-        val_acc, val_precision, val_recall, val_f1 = contrastive_metrics(val_similarities, val_labels_epoch)
-        train_acc, train_precision, train_recall, train_f1 = contrastive_metrics(train_similarities, train_labels_epoch)
-        train_auc = roc_auc_score(train_labels_epoch, train_similarities)
-        val_auc = roc_auc_score(val_labels_epoch, val_similarities)
+        for batch in tqdm(train_loader, desc="Training"):
+            global_step += 1
+            optimizer.zero_grad()
+            if esm_optimizer is not None:
+                esm_optimizer.zero_grad()
 
-        train_losses.append(train_loss)
-        val_losses.append(val_loss)
-        train_accs.append(train_acc)
-        val_accs.append(val_acc)
-        train_aucs.append(train_auc)
-        val_aucs.append(val_auc)
+            #sequences = batch['sequences']
+            quartiles = batch['quartiles']
 
-        if val_auc > best_val_auc:
-            best_val_auc = val_auc
-            patience_counter = 0
-            best_model_state = projection_net.state_dict().copy()
-            if args.use_lora and esm_model is not None:  # NEW
-                best_esm_state = esm_model.state_dict().copy()
-                best_esm_optimizer_state = esm_optimizer.state_dict().copy()
-            best_optimizer_state = optimizer.state_dict().copy()
-            print(f" Epoch {epoch+1}: New best val auc: {best_val_auc:.4f}")
-        else:
-            patience_counter += 1
+            #project embeddings
+            projected = projection_net(batch)
+            #train_projections.extend(projected.cpu().detach().numpy())
+
+            #compute loss
+            loss, similarities, distances, labels = loss_fn(projected, quartiles)
+
+            #backward pass
+            loss.backward()
+            optimizer.step()
+            if esm_optimizer is not None:
+                esm_optimizer.step()
+
+            total_loss += loss.item()
+            num_batches += 1
+
+            train_similarities.extend(similarities)
+            train_distances.extend(distances)
+            train_labels.extend(labels)
+            train_quartiles.extend(quartiles)
+
+            if global_step % args.eval_steps == 0:
+                #eval
+                val_loss, val_similarities, val_labels_epoch, val_dists, val_quartiles, val_projections = evaluate_model(
+                    projection_net, loss_fn, test_loader, device
+                )
+
+                val_acc, val_precision, val_recall, val_f1 = contrastive_metrics(val_similarities, val_labels_epoch)
+                train_acc, train_precision, train_recall, train_f1 = contrastive_metrics(train_similarities, train_labels)
+                train_auc = roc_auc_score(train_labels, train_similarities)
+                val_auc = roc_auc_score(val_labels_epoch, val_similarities)
+                #ridge_acc, ridge_precision, ridge_recall, ridge_f1, ridge_auc = ridge_metrics(train_projections, train_quartiles, val_projections, val_quartiles) #would have to split val projections by position
+
+                #wandb log
+                wandb.log({
+                    'avg_train_loss': total_loss / num_batches,
+                    'avg_val_loss': val_loss,
+                    'train_similarity_acc': train_acc,
+                    'val_similarity_acc': val_acc,
+                    'train_similarity_auc': train_auc,
+                    'val_similarity_auc': val_auc,
+                    'epoch': epoch + 1,
+                    'patience_counter': patience_counter,
+                    'global_step': global_step
+                })
+
+                train_losses.append(total_loss / num_batches)
+                val_losses.append(val_loss)
+                train_accs.append(train_acc)
+                val_accs.append(val_acc)
+                train_aucs.append(train_auc)
+                val_aucs.append(val_auc)
+
+                if val_auc > best_val_auc:
+                    best_val_auc = val_auc
+                    patience_counter = 0
+                    best_model_state = projection_net.state_dict().copy()
+                    if args.use_lora and esm_model is not None:  # NEW
+                        best_esm_state = esm_model.state_dict().copy()
+                        best_esm_optimizer_state = esm_optimizer.state_dict().copy()
+                    best_optimizer_state = optimizer.state_dict().copy()
+                    print(f" Step {global_step+1}: New best val auc: {best_val_auc:.4f}")
+                else:
+                    patience_counter += 1
 
         #if (epoch + 1) % 5 == 0:
         print(f"Epoch {epoch+1}/{NUM_EPOCHS}")

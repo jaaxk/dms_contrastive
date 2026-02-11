@@ -13,12 +13,12 @@ BASE_DATA_PATH="/gpfs/scratch/jv2807/dms_data"
 
 EMBEDDING_LAYER="layer33_mean"
 
-for COARSE_SELECTION_TYPE in "OrganismalFitness" "Binding" "Activity" "Expression" ; do
+for COARSE_SELECTION_TYPE in "Stability" "OrganismalFitness" "Binding" "Activity" "Expression" ; do
     echo "Running ${COARSE_SELECTION_TYPE} ${EMBEDDING_LAYER}"
 
     RUN_NAME="650M_splitbygene_lora2_${COARSE_SELECTION_TYPE}_${EMBEDDING_LAYER}"
 
-    python -u pipeline.tmp.py --run_name $RUN_NAME \
+    python -u pipeline.py --run_name $RUN_NAME \
         --data_path $BASE_DATA_PATH/datasets/${COARSE_SELECTION_TYPE}.csv \
         --embeddings_path $BASE_DATA_PATH/embeddings/${COARSE_SELECTION_TYPE}/650M_t33_mean_layer33.h5 \
         --ohe_embeddings_path $BASE_DATA_PATH/embeddings/${COARSE_SELECTION_TYPE}/ohe_embeddings.h5 \
@@ -27,7 +27,8 @@ for COARSE_SELECTION_TYPE in "OrganismalFitness" "Binding" "Activity" "Expressio
         --esm_max_length 600 \
         --input_dim 1280 \
         --batch_size 16 \
-        --patience 2 \
+        --patience 15 \
+        --eval_steps 500 \
         --dropout 0.0 \
         --metadata_path $BASE_DATA_PATH/datasets/DMS_substitutions.csv \
         --num_epochs 10 \
@@ -36,7 +37,6 @@ for COARSE_SELECTION_TYPE in "OrganismalFitness" "Binding" "Activity" "Expressio
         --split_by_gene \
         --split_file /gpfs/home/jv2807/dms_contrastive/results/650M_NWT_savesplit_${COARSE_SELECTION_TYPE}_layer33_mean/data_split.json \
         --use_lora
-
 
 done
 
