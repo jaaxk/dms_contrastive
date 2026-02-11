@@ -55,6 +55,7 @@ def parse_args():
     parser.add_argument('--distance_metric', choices=['cosine', 'euclidean'], default='cosine')
     parser.add_argument('--use_learnable', type=bool, default=False)
     parser.add_argument('--gradient_accumulation_steps', type=int, default=1, help='Number of steps to accumulate gradients for before updating model weights')
+    parser.add_argument('--eval_batches_during_training', type=int, default=999999, help='Number of batches to evaluate on during training - set higher for more stable eval metrics but longer training time')
 
     #model hyperparams
     parser.add_argument('--hidden_dims', type=list, default=[512, 256, 128])
@@ -99,7 +100,7 @@ def parse_args():
     #wandb args
     parser.add_argument('--wandb_project', type=str, default='dms-contrastive', help='Weights and Biases project name')
     parser.add_argument('--wandb_entity', type=str, default='jack-vaska-nyu-langone-health', help='Weights and Biases entity name')
-    parser.add_argument('--eval_steps', type=int, default=700, help='Save model and eval metrics every N steps (batches)')
+    parser.add_argument('--eval_steps', type=int, default=None, help='Save model and eval metrics every N steps (batches), if not specified, will evaluate ~5 times per epoch')
 
     args = parser.parse_args()
     print(args)
@@ -618,7 +619,7 @@ def create_train_test_split(df, split_by_gene=True, split_by_position=None, test
             print('WARNING: Not using pre-defined gene split file - creating new random split')
             good_split = False #we need to ensure we have more train seqs than test seqs. sometimes splitting by gene will give larger genes to test set, especially with small number of genes.
             while not good_split:
-                train_genes, test_genes = train_test_split(all_genes, test_size=test_size, random_state=42)
+                train_genes, test_genes = train_test_split(all_genes, test_size=test_size)
                 train_seqs = len(df[df['uniprot_id'].isin(train_genes)])
                 test_seqs = len(df[df['uniprot_id'].isin(test_genes)])
                 if test_seqs < train_seqs:
@@ -771,7 +772,7 @@ def evaluate_model(projection_net, loss_fn, dataloader, device):
     num_batches = 0
 
     with torch.no_grad():
-        for batch in tqdm(dataloader, desc="Evaluation"):
+        for i, batch in enumerate(tqdm(dataloader, desc="Evaluation")):
             quartiles = batch['quartiles']
 
             #project embeddings
@@ -788,6 +789,11 @@ def evaluate_model(projection_net, loss_fn, dataloader, device):
             all_distances.extend(distances)
             all_labels.extend(labels)
             all_quartiles.extend(quartiles)
+
+            if i>args.eval_batches_during_training:
+                if dataloader.shuffle == False:
+                    raise ValueError("should not stop evaluation early on a non-shuffled dataloader! - otherwise we miss some genes entirely")
+                break
 
     avg_loss = total_loss / max(num_batches, 1)
     return avg_loss, all_similarities, all_labels, all_distances, all_quartiles, all_projections
@@ -1353,6 +1359,17 @@ def train(projection_net, loss_fn, train_loader, test_loader, optimizer, device)
     print("STARTING TRAINING")
     print(f"{'='*80}\n")
 
+    print(f'Batches: {len(train_loader)}')
+    print(f'Effective batch size (after gradient accumulation): {train_loader.batch_size * args.gradient_accumulation_steps}')
+    effective_batches = len(train_loader) // args.gradient_accumulation_steps
+    if args.eval_steps is None:
+        args.eval_steps = effective_batches // 5  # Default to evaluating 5 times per epoch
+    print('Effective batches (after gradient accumulation):', effective_batches)
+    print(f'Evaluating every {args.eval_steps} effective batches')
+    print(f'Evaluations per epoch: {effective_batches // args.eval_steps}')
+    if args.patience < (effective_batches // args.eval_steps):
+        print(f'**WARNING: patience ({args.patience}) is less than the number of evaluations per epoch ({effective_batches // args.eval_steps}), which may lead to early stopping before one full epoch is completed.')
+
     for epoch in range(NUM_EPOCHS):
         print(f"\nEpoch {epoch+1}/{NUM_EPOCHS}")
         #train
@@ -1390,13 +1407,6 @@ def train(projection_net, loss_fn, train_loader, test_loader, optimizer, device)
             #backward pass
             loss.backward()
 
-            if (batch_idx + 1) % args.gradient_accumulation_steps == 0:
-                optimizer.step()
-                if esm_optimizer is not None:
-                    esm_optimizer.step()
-                
-                global_step += 1
-
             total_loss += loss.item()
             num_batches += 1
 
@@ -1405,49 +1415,56 @@ def train(projection_net, loss_fn, train_loader, test_loader, optimizer, device)
             train_labels.extend(labels)
             train_quartiles.extend(quartiles)
 
-            if global_step % args.eval_steps == 0:
-                #eval
-                val_loss, val_similarities, val_labels_epoch, val_dists, val_quartiles, val_projections = evaluate_model(
-                    projection_net, loss_fn, test_loader, device
-                )
+            if (batch_idx + 1) % args.gradient_accumulation_steps == 0:
+                optimizer.step()
+                if esm_optimizer is not None:
+                    esm_optimizer.step()
+                
+                global_step += 1
 
-                val_acc, val_precision, val_recall, val_f1 = contrastive_metrics(val_similarities, val_labels_epoch)
-                train_acc, train_precision, train_recall, train_f1 = contrastive_metrics(train_similarities, train_labels)
-                train_auc = roc_auc_score(train_labels, train_similarities)
-                val_auc = roc_auc_score(val_labels_epoch, val_similarities)
-                #ridge_acc, ridge_precision, ridge_recall, ridge_f1, ridge_auc = ridge_metrics(train_projections, train_quartiles, val_projections, val_quartiles) #would have to split val projections by position
+                if global_step % args.eval_steps == 0:
+                    #eval
+                    val_loss, val_similarities, val_labels_epoch, val_dists, val_quartiles, val_projections = evaluate_model(
+                        projection_net, loss_fn, test_loader, device
+                    )
 
-                #wandb log
-                wandb.log({
-                    'avg_train_loss': total_loss / num_batches,
-                    'avg_val_loss': val_loss,
-                    'train_similarity_acc': train_acc,
-                    'val_similarity_acc': val_acc,
-                    'train_similarity_auc': train_auc,
-                    'val_similarity_auc': val_auc,
-                    'epoch': epoch + 1,
-                    'patience_counter': patience_counter,
-                    'global_step': global_step
-                })
+                    val_acc, val_precision, val_recall, val_f1 = contrastive_metrics(val_similarities, val_labels_epoch)
+                    train_acc, train_precision, train_recall, train_f1 = contrastive_metrics(train_similarities, train_labels)
+                    train_auc = roc_auc_score(train_labels, train_similarities)
+                    val_auc = roc_auc_score(val_labels_epoch, val_similarities)
+                    #ridge_acc, ridge_precision, ridge_recall, ridge_f1, ridge_auc = ridge_metrics(train_projections, train_quartiles, val_projections, val_quartiles) #would have to split val projections by position
 
-                train_losses.append(total_loss / num_batches)
-                val_losses.append(val_loss)
-                train_accs.append(train_acc)
-                val_accs.append(val_acc)
-                train_aucs.append(train_auc)
-                val_aucs.append(val_auc)
+                    #wandb log
+                    wandb.log({
+                        'avg_train_loss': total_loss / num_batches,
+                        'avg_val_loss': val_loss,
+                        'train_similarity_acc': train_acc,
+                        'val_similarity_acc': val_acc,
+                        'train_similarity_auc': train_auc,
+                        'val_similarity_auc': val_auc,
+                        'epoch': epoch + 1,
+                        'patience_counter': patience_counter,
+                        'global_step': global_step
+                    })
 
-                if val_auc > best_val_auc:
-                    best_val_auc = val_auc
-                    patience_counter = 0
-                    best_model_state = projection_net.state_dict().copy()
-                    if args.use_lora and esm_model is not None:  # NEW
-                        best_esm_state = esm_model.state_dict().copy()
-                        best_esm_optimizer_state = esm_optimizer.state_dict().copy()
-                    best_optimizer_state = optimizer.state_dict().copy()
-                    print(f" Step {global_step+1}: New best val auc: {best_val_auc:.4f}")
-                else:
-                    patience_counter += 1
+                    train_losses.append(total_loss / num_batches)
+                    val_losses.append(val_loss)
+                    train_accs.append(train_acc)
+                    val_accs.append(val_acc)
+                    train_aucs.append(train_auc)
+                    val_aucs.append(val_auc)
+
+                    if val_auc > best_val_auc:
+                        best_val_auc = val_auc
+                        patience_counter = 0
+                        best_model_state = projection_net.state_dict().copy()
+                        if args.use_lora and esm_model is not None:
+                            best_esm_state = esm_model.state_dict().copy()
+                            best_esm_optimizer_state = esm_optimizer.state_dict().copy()
+                        best_optimizer_state = optimizer.state_dict().copy()
+                        print(f" Step {global_step+1}: New best val auc: {best_val_auc:.4f}")
+                    else:
+                        patience_counter += 1
 
         #if (epoch + 1) % 5 == 0:
         print(f"Epoch {epoch+1}/{NUM_EPOCHS}")
@@ -1587,11 +1604,12 @@ def main():
     if args.same_gene_batch:
         train_loader = DataLoader(train_dataset, batch_size=BATCH_SIZE, gene_to_wt = gene_to_wt, shuffle=True, gene_aware=True)
         test_loader = DataLoader(test_dataset, batch_size=BATCH_SIZE, gene_to_wt = gene_to_wt, shuffle=False, gene_aware=True)
-    else:
+    else: #we're usually here
         train_loader = DataLoader(train_dataset, batch_size=BATCH_SIZE, gene_to_wt = gene_to_wt, shuffle=True, gene_aware=False)
         test_loader = DataLoader(test_dataset, batch_size=BATCH_SIZE, gene_to_wt = gene_to_wt, shuffle=False, gene_aware=False)
-        gene_aware_test_loader = DataLoader(test_dataset, batch_size=BATCH_SIZE, gene_to_wt=gene_to_wt, shuffle=False, gene_aware=True)
-        gene_aware_train_loader = DataLoader(train_dataset, batch_size=BATCH_SIZE, gene_to_wt=gene_to_wt, shuffle=True, gene_aware=True)
+        test_loader_shuffled = DataLoader(test_dataset, batch_size=BATCH_SIZE, gene_to_wt = gene_to_wt, shuffle=True, gene_aware=False) #shuffled version so we can shorten training time by using fewer batches for evaluation during training
+        gene_aware_test_loader = DataLoader(test_dataset, batch_size=BATCH_SIZE, gene_to_wt=gene_to_wt, shuffle=False, gene_aware=True) #should NOT be shuffled because we expect genes to be in a row for comparison_classification_performance
+        #gene_aware_train_loader = DataLoader(train_dataset, batch_size=BATCH_SIZE, gene_to_wt=gene_to_wt, shuffle=True, gene_aware=True)
 
 
     print(f"\n Data loaders created")
@@ -1644,7 +1662,7 @@ def main():
             raise ValueError("Model checkpoint contains ESM LoRA state dict but ESM model is not initialized - make sure --use_lora is set even if just evaluating")
         print(" Model loaded successfully")
     else:
-        best_model_state, best_esm_model_state = train(projection_net, loss_fn, train_loader, test_loader, optimizer, device)
+        best_model_state, best_esm_model_state = train(projection_net, loss_fn, train_loader, test_loader_shuffled, optimizer, device)
         print("\n Restoring best model...")
         projection_net.load_state_dict(best_model_state)
         if args.use_lora:

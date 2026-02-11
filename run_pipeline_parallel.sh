@@ -31,15 +31,15 @@ for i in "${!SELECTION_TYPES[@]}"; do
         --input_dim 1280 \
         --batch_size 4 \
         --gradient_accumulation_steps 8 \
-        --patience 15 \
-        --eval_steps 500 \
+        --patience 10 \
+        --eval_batches_during_training 2000 \
         --dropout 0.0 \
         --metadata_path $BASE_DATA_PATH/datasets/DMS_substitutions.csv \
         --num_epochs 10 \
         --normalize_to_wt \
         --ohe_baseline \
         --split_by_gene \
-\        --use_lora \
+        --use_lora \
         > logs/${SLURM_JOB_ID}_${COARSE_SELECTION_TYPE}.out 2>&1 &
 done
 
