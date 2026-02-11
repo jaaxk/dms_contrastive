@@ -79,8 +79,21 @@ def parse_args():
     parser.add_argument('--ohe_baseline', action='store_true', default=False)
     parser.add_argument('--model_path', type=str, default=None, help='path to pre-trained PROJECTION HEAD')
     parser.add_argument('--esm_variants_module_path', default='/gpfs/home/jv2807/dms_contrastive/esm-variants')
-    parser.add_argument('--gene_split_file', type=str, default=None, help='path to json file specifying gene train/test split')
+    parser.add_argument('--split_file', type=str, default=None, help='path to json file specifying train/test split')
     parser.add_argument('--set_seed', action='store_true', help='set random seed to 42 for reproducibility', default=False)
+
+    # LoRA finetuning args
+    parser.add_argument('--use_lora', action='store_true', default=False, 
+                        help='Enable LoRA finetuning of ESM model - needs to be specified EVEN IF JUST EVALUATING a finetuned model')
+    parser.add_argument('--lora_rank', type=int, default=8, 
+                        help='LoRA rank')
+    parser.add_argument('--lora_alpha', type=int, default=16, 
+                        help='LoRA alpha (scaling factor)')
+    parser.add_argument('--lora_target_modules', type=str, nargs='+', 
+                        default=['query', 'value'],
+                        help='Target modules for LoRA')
+    parser.add_argument('--esm_lr', type=float, default=0.00005, 
+                        help='Learning rate for ESM LoRA adapter')
 
     args = parser.parse_args()
     print(args)
@@ -130,10 +143,17 @@ if args.normalize_to_wt:
         raise ValueError("--metadata_path must be specified if --normalize_to_wt is set")
     
 #init ESM model
-if args.model_path is None:
+if args.model_path is None or args.use_lora:
     esm_model = AutoModel.from_pretrained(args.model_name)
     tokenizer = AutoTokenizer.from_pretrained(args.model_name)
-    esm_model.eval() #REMOVE once we are finetuning
+
+    if args.use_lora:
+        from scripts.lora_utils import setup_lora_esm, save_lora_adapter, load_lora_adapter
+        esm_model = setup_lora_esm(esm_model, lora_rank=args.lora_rank, lora_alpha=args.lora_alpha, target_modules=args.lora_target_modules)
+        esm_model.train()
+    else:
+        esm_model.eval()
+
     esm_model.to(device)
 else:
     esm_model = None
@@ -158,6 +178,8 @@ if args.model_path is not None:
     DATA_SPLIT_PATH = f'{os.path.dirname(args.model_path)}/data_split.json'
     if not os.path.exists(DATA_SPLIT_PATH):
         raise ValueError(f"Data split file not found at {DATA_SPLIT_PATH}, cannot load embeddings for evaluation - bypass this if you want to evaluate a model on a different split (BUT BE AWARE OF DATA LEAKAGE!)")
+elif args.split_file is not None:
+    DATA_SPLIT_PATH = args.split_file
 else:
     DATA_SPLIT_PATH = None
 
@@ -180,12 +202,20 @@ if args.set_seed:
     set_seed(42)
 
 def esm_batch(sequences):
-    print('ESM BATCH METHOD')
+    #print('ESM BATCH METHOD')
     tokenized = tokenizer(sequences, padding=True, truncation=True, max_length=args.esm_max_length, return_tensors="pt")
     batch_tokens = tokenized['input_ids'].to(device)
     attention_mask = tokenized['attention_mask'].to(device)
-    with torch.no_grad(): #remove this once we're ready to finetune
-        results = esm_model(input_ids=batch_tokens, attention_mask=attention_mask, output_hidden_states=False)
+    
+    # Only use no_grad if ESM is frozen
+    if args.use_lora:
+        results = esm_model(input_ids=batch_tokens, attention_mask=attention_mask, 
+                           output_hidden_states=False)
+    else:
+        with torch.no_grad():
+            results = esm_model(input_ids=batch_tokens, attention_mask=attention_mask, 
+                            output_hidden_states=False)
+
     reps = results["last_hidden_state"].to(device)    
     #mean pooling
     mask = attention_mask.unsqueeze(-1)          # (B, L, 1)
@@ -193,9 +223,8 @@ def esm_batch(sequences):
     sum_reps = masked_reps.sum(dim=1)
     lengths = mask.sum(dim=1)
     embeddings_batch = sum_reps / lengths         # (B, H)
-    out = embeddings_batch
 
-    return out
+    return embeddings_batch
 
 class DMSContrastiveDataset(Dataset):
     def __init__(self, sequences, quartiles, dms_scores, genes, mutants=None):
@@ -366,7 +395,10 @@ class DataLoader():
             ohe_features = None
             mutants = None
 
-        embeddings = load_embeddings_h5(sequences, embedding_loader=ESMEmbeddingLoader, embedding_type='esm')
+        if not args.use_lora:
+            embeddings = load_embeddings_h5(sequences, embedding_loader=ESMEmbeddingLoader, embedding_type='esm')
+        else:
+            embeddings = None
 
         return {
             'quartiles': quartiles,
@@ -412,7 +444,10 @@ class ContrastiveNetwork(nn.Module):
 
     def forward(self, batch):
 
-        out = batch['embeddings']
+        if args.use_lora:
+            out = esm_batch(batch['sequences'])
+        else:
+            out = batch['embeddings']
 
         if self.normalize_to_wt:
             out = out - batch['wt_embeddings']
@@ -564,7 +599,9 @@ def create_train_test_split(df, split_by_gene=True, split_by_position=None, test
 
     if split_by_gene:
         print('Splitting by gene...')
-        if DATA_SPLIT_PATH is not None and os.path.exists(DATA_SPLIT_PATH):
+        if DATA_SPLIT_PATH is not None:
+            if not os.path.exists(DATA_SPLIT_PATH):
+                raise FileNotFoundError(f"Data split file {DATA_SPLIT_PATH} does not exist")
             print(f"Loading gene split from {DATA_SPLIT_PATH}")
             with open(DATA_SPLIT_PATH, 'r') as f:
                 split_to_genes = json.load(f)
@@ -708,8 +745,11 @@ def get_embeddings_from_model(projection_net, dataloader, device):
     
     return all_projections
 
-def train_epoch(projection_net, loss_fn, dataloader, optimizer, device):
+def train_epoch(projection_net, loss_fn, dataloader, optimizer, device, esm_optimizer=None):
     projection_net.train()
+    if args.use_lora and esm_model is not None:
+        esm_model.train()
+
 
     total_loss = 0
     all_similarities = []
@@ -721,6 +761,8 @@ def train_epoch(projection_net, loss_fn, dataloader, optimizer, device):
 
     for batch in tqdm(dataloader, desc="Training"):
         optimizer.zero_grad()
+        if esm_optimizer is not None:
+            esm_optimizer.zero_grad()
 
         #sequences = batch['sequences']
         quartiles = batch['quartiles']
@@ -735,6 +777,8 @@ def train_epoch(projection_net, loss_fn, dataloader, optimizer, device):
         #backward pass
         loss.backward()
         optimizer.step()
+        if esm_optimizer is not None:
+            esm_optimizer.step()
 
         total_loss += loss.item()
         num_batches += 1
@@ -1309,6 +1353,10 @@ def llr_threshold_performance(test_loader):
  
 
 def train(projection_net, loss_fn, train_loader, test_loader, optimizer, device):
+    """
+    optimizer is for projection_net
+    Create separate optimizer for ESM LoRA if needed
+    """
     
     train_losses = []
     val_losses = []
@@ -1321,6 +1369,12 @@ def train(projection_net, loss_fn, train_loader, test_loader, optimizer, device)
     best_val_auc = float('-inf')
     patience_counter = 0
     best_model_state = None
+    best_esm_state = None
+
+    esm_optimizer = None
+    if args.use_lora and esm_model is not None:
+        esm_optimizer = optim.Adam(esm_model.parameters(), lr=args.esm_lr)
+        print(f"ESM LoRA optimizer initialized with lr={args.esm_lr}")
     
     print(f"\n{'='*80}")
     print("STARTING TRAINING")
@@ -1330,7 +1384,7 @@ def train(projection_net, loss_fn, train_loader, test_loader, optimizer, device)
         print(f"\nEpoch {epoch+1}/{NUM_EPOCHS}")
         #train
         train_loss, train_similarities, train_labels_epoch, train_dists, train_quartiles, train_projections = train_epoch(
-            projection_net, loss_fn, train_loader, optimizer, device
+            projection_net, loss_fn, train_loader, optimizer, device, esm_optimizer=esm_optimizer
         )
 
         #eval
@@ -1360,6 +1414,9 @@ def train(projection_net, loss_fn, train_loader, test_loader, optimizer, device)
             best_val_auc = val_auc
             patience_counter = 0
             best_model_state = projection_net.state_dict().copy()
+            if args.use_lora and esm_model is not None:  # NEW
+                best_esm_state = esm_model.state_dict().copy()
+                best_esm_optimizer_state = esm_optimizer.state_dict().copy()
             best_optimizer_state = optimizer.state_dict().copy()
             print(f" Epoch {epoch+1}: New best val auc: {best_val_auc:.4f}")
         else:
@@ -1393,20 +1450,28 @@ def train(projection_net, loss_fn, train_loader, test_loader, optimizer, device)
     torch.save({
         'model_state_dict': best_model_state,
         'optimizer_state_dict': best_optimizer_state,
+        'esm_model_state_dict': best_esm_state if args.use_lora else None,
         'train_losses': train_losses,
         'val_losses': val_losses,
         'config': {
             'distance_metric': DISTANCE_METRIC,
             'hidden_dims': HIDDEN_DIMS,
             'learning_rate': LEARNING_RATE,
-            'best_val_auc': best_val_auc
+            'best_val_auc': best_val_auc,
+            'use_lora': args.use_lora,  # NEW
         }
-    }, f'{RESULTS_DIR}/projection_head.pt')
-    print(f" Model saved to '{RESULTS_DIR}/projection_head.pt'")
+    }, f'{RESULTS_DIR}/model.pt')
+    print(f" Model saved to '{RESULTS_DIR}/model.pt'")
+    
+    # NEW: Save LoRA adapter separately
+    if args.use_lora and esm_model is not None:
+        lora_save_dir = f'{RESULTS_DIR}/esm_lora_adapter'
+        os.makedirs(lora_save_dir, exist_ok=True)
+        save_lora_adapter(esm_model, lora_save_dir)
 
     plot_training_metrics(train_losses, val_losses, train_aucs, val_aucs)
 
-    return best_model_state
+    return best_model_state, best_esm_state
 
 
 
@@ -1545,10 +1610,18 @@ def main():
         print(f"\n Loading model from {args.model_path}")
         checkpoint = torch.load(args.model_path, map_location=device)
         projection_net.load_state_dict(checkpoint['model_state_dict'])
+        if checkpoint.get('esm_model_state_dict') is not None:
+            print(" Loading ESM LoRA adapter state")
+            esm_model.load_state_dict(checkpoint['esm_model_state_dict']) #load whole model state dict, but only the adapter weights will be updated since the rest of the model is frozen
+        elif esm_model is None:
+            raise ValueError("Model checkpoint contains ESM LoRA state dict but ESM model is not initialized - make sure --use_lora is set even if just evaluating")
+        print(" Model loaded successfully")
     else:
-        best_model_state = train(projection_net, loss_fn, train_loader, test_loader, optimizer, device)
+        best_model_state, best_esm_model_state = train(projection_net, loss_fn, train_loader, test_loader, optimizer, device)
         print("\n Restoring best model...")
         projection_net.load_state_dict(best_model_state)
+        if args.use_lora:
+            esm_model.load_state_dict(best_esm_model_state)
 
     if args.ohe_baseline:
         print("\n=== BASELINE vs PROJECTION EVALUATION ===")
