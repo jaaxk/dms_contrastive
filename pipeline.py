@@ -83,6 +83,10 @@ def parse_args():
     parser.add_argument('--esm_variants_module_path', default='/gpfs/home/jv2807/dms_contrastive/esm-variants')
     parser.add_argument('--split_file', type=str, default=None, help='path to json file specifying train/test split')
     parser.add_argument('--set_seed', action='store_true', help='set random seed to 42 for reproducibility', default=False)
+    parser.add_argument('--test_same_gene_batch', action='store_true', help='for evaluation only, whether to use a gene-aware test loader that creates batches of variants from the same gene, rather than random batches', default=False)
+    parser.add_argument('--test_different_gene_batch', action='store_true')
+    parser.add_argument('--train_same_gene_batch', action='store_true', help='for training, whether to use a gene-aware train loader that creates batches of variants from the same gene, rather than random batches - if --same_gene_batch is set, this is automatically set to True', default=False)
+    parser.add_argument('--train_different_gene_batch', action='store_true')
 
     # LoRA finetuning args
     parser.add_argument('--use_lora', action='store_true', default=False, 
@@ -304,6 +308,10 @@ class DataLoader():
         self.balance_quartiles = balance_quartiles
         self.gene_to_wt = gene_to_wt
         self.gene_aware = gene_aware
+        self.load_ohe = False
+
+        if self.gene_aware == False and self.shuffle==False:
+            raise ValueError('If gene_aware is False, shuffle must be True - otherwise it is not truly different-gene batches')
 
         if gene_aware:
             self.gene_groups = {}
@@ -398,7 +406,7 @@ class DataLoader():
         else:
             wt_embeddings = None
 
-        if args.ohe_baseline and self.gene_aware:
+        if args.ohe_baseline and self.gene_aware and self.load_ohe:
             #print('gene-aware ohe batch iteration')
             mutants = [item['mutant'] for item in batch]
             ohe_features = load_embeddings_h5(sequences, embedding_loader=OHEEmbeddingLoader, embedding_type='ohe', mutants=mutants, wt_seqs=wt_sequences)
@@ -793,10 +801,10 @@ def evaluate_model(projection_net, loss_fn, dataloader, device):
             all_labels.extend(labels)
             all_quartiles.extend(quartiles)
 
-            if i>args.eval_batches_during_training and args.eval_batches_during_training != 999999:
-                if dataloader.shuffle == False:
-                    raise ValueError("should not stop evaluation early on a non-shuffled dataloader! - otherwise we miss some genes entirely")
-                break
+            #if i>args.eval_batches_during_training and args.eval_batches_during_training != 999999:
+            #    if dataloader.shuffle == False:
+            #        raise ValueError("should not stop evaluation early on a non-shuffled dataloader! - otherwise we miss some genes entirely")
+            #    break
 
     avg_loss = total_loss / max(num_batches, 1)
     return avg_loss, all_similarities, all_labels, all_distances, all_quartiles, all_projections
@@ -1134,6 +1142,8 @@ def classification_comparison_by_train_size(projection_net, dataloader, device, 
     #then plot performance vs train size
     #dataloader must NOT be shuffled and MUST be gene-aware
     from scipy import stats
+
+    dataloader.load_ohe = True
 
     plot_dir = f'{RESULTS_DIR}/train_size_plots'
     os.makedirs(plot_dir, exist_ok=True)
@@ -1605,15 +1615,19 @@ def main():
                                          test_genes, test_mutants)
 
     #create data loaders
-    if args.same_gene_batch:
+    if args.train_same_gene_batch:
         train_loader = DataLoader(train_dataset, batch_size=BATCH_SIZE, gene_to_wt = gene_to_wt, shuffle=True, gene_aware=True)
-        test_loader = DataLoader(test_dataset, batch_size=BATCH_SIZE, gene_to_wt = gene_to_wt, shuffle=False, gene_aware=True)
-    else: #we're usually here
+    elif args.train_different_gene_batch:
         train_loader = DataLoader(train_dataset, batch_size=BATCH_SIZE, gene_to_wt = gene_to_wt, shuffle=True, gene_aware=False)
-        test_loader = DataLoader(test_dataset, batch_size=BATCH_SIZE, gene_to_wt = gene_to_wt, shuffle=False, gene_aware=False)
-        test_loader_shuffled = DataLoader(test_dataset, batch_size=BATCH_SIZE, gene_to_wt = gene_to_wt, shuffle=True, gene_aware=False) #shuffled version so we can shorten training time by using fewer batches for evaluation during training
-        gene_aware_test_loader = DataLoader(test_dataset, batch_size=BATCH_SIZE, gene_to_wt=gene_to_wt, shuffle=False, gene_aware=True) #should NOT be shuffled because we expect genes to be in a row for comparison_classification_performance
-        #gene_aware_train_loader = DataLoader(train_dataset, batch_size=BATCH_SIZE, gene_to_wt=gene_to_wt, shuffle=True, gene_aware=True)
+    else:
+        raise ValueError("Must specify either --train_same_gene_batch or --train_different_gene_batch")
+
+    if args.test_same_gene_batch:
+        test_loader = DataLoader(test_dataset, batch_size=BATCH_SIZE, gene_to_wt = gene_to_wt, shuffle=False, gene_aware=True)
+    elif args.test_different_gene_batch:
+        test_loader = DataLoader(test_dataset, batch_size=BATCH_SIZE, gene_to_wt = gene_to_wt, shuffle=True, gene_aware=False)
+    else:
+        raise ValueError("Must specify either --test_same_gene_batch or --test_different_gene_batch")
 
 
     print(f"\n Data loaders created")
@@ -1676,6 +1690,10 @@ def main():
         print("\n=== BASELINE vs PROJECTION EVALUATION ===")
         #llr_threshold_performance(gene_aware_test_loader)
         #ohe_llr_baseline(loss_fn, gene_aware_test_loader)
+        if args.test_same_gene_batch:
+            gene_aware_test_loader = test_loader
+        else:
+            gene_aware_test_loader = DataLoader(test_dataset, batch_size=BATCH_SIZE, gene_to_wt = gene_to_wt, shuffle=False, gene_aware=True)
         classification_comparison_by_train_size(projection_net, gene_aware_test_loader, device, train_sizes=[.01, .025, .05, .1, .2, .4, .6, .8, 1.0])
         return
 
@@ -1710,98 +1728,39 @@ def main():
         'ridge_auc': ridge_auc
     })
 
-    #test_acc, test_precision, test_recall, test_f1 = contrastive_metrics(test_similarities, test_labels)
-    
 
-    test_auc = roc_auc_score(test_labels, test_similarities) #auc based on similarities
-
-    """
-    #Gene-aware evaluation
-    print('gene-aware batch evaluation')
-    gene_aware_final_loss, gene_aware_final_similarities, gene_aware_final_labels, gene_aware_final_dists, gene_aware_final_quartiles, gene_aware_final_projections = evaluate_model(
-        projection_net, loss_fn, gene_aware_test_loader, device
-    )
-    gene_aware_test_acc, gene_aware_test_precision, gene_aware_test_recall, gene_aware_test_f1 = contrastive_metrics(gene_aware_final_similarities, gene_aware_final_labels)
-    gene_aware_test_auc = roc_auc_score(gene_aware_final_labels, gene_aware_final_similarities)
-
-    #original ESM evaluation - normalize to wt
-    if args.normalize_to_wt:
-        esm_only_model_normalize = ContrastiveNetwork(
-            input_dim=args.input_dim,
-            hidden_dims=HIDDEN_DIMS,
-            normalize_output=NORMALIZE_OUTPUT,
-            esm_layer=args.esm_layer,
-            esm_only=True,
-            normalize_to_wt=True
-        ).to(device)
-        print('og esm embeddings evaluation - main batch type - normalize to wt')
-        original_normalize_test_loss, original_normalize_test_similarities, original_normalize_test_labels, original_normalize_test_dists, original_normalize_test_quartiles, original_normalize_test_projections = evaluate_model(
-            esm_only_model_normalize, loss_fn, test_loader, device
-        )
-        original_normalize_test_acc, original_normalize_test_precision, original_normalize_test_recall, original_normalize_test_f1 = contrastive_metrics(original_normalize_test_similarities, original_normalize_test_labels)
-        original_normalize_test_auc = roc_auc_score(original_normalize_test_labels, original_normalize_test_similarities)
-
-        print('og esm embeddings evaluation - gene-aware batch type - normalize to wt')
-        original_normalize_gene_aware_test_loss, original_normalize_gene_aware_test_similarities, original_normalize_gene_aware_test_labels, original_normalize_gene_aware_test_dists, original_normalize_gene_aware_test_quartiles, original_normalize_gene_aware_test_projections = evaluate_model(
-            esm_only_model_normalize, loss_fn, gene_aware_test_loader, device
-        )
-        original_normalize_gene_aware_test_acc, original_normalize_gene_aware_test_precision, original_normalize_gene_aware_test_recall, original_normalize_gene_aware_test_f1 = contrastive_metrics(original_normalize_gene_aware_test_similarities, original_normalize_gene_aware_test_labels)
-        original_normalize_gene_aware_test_auc = roc_auc_score(original_normalize_gene_aware_test_labels, original_normalize_gene_aware_test_similarities)
-    else:
-        original_normalize_test_loss = '-'
-        original_normalize_test_similarities = '-'
-        original_normalize_test_labels = '-'
-        original_normalize_test_dists = '-'
-        original_normalize_test_quartiles = '-'
-        original_normalize_test_projections = '-'
-        original_normalize_test_acc = '-'
-        original_normalize_test_precision = '-'
-        original_normalize_test_recall = '-'
-        original_normalize_test_f1 = '-'
-        original_normalize_test_auc = '-'
-
-
-    #otiginal ESM eval - NOT normalizing to wt
-    esm_only_model_no_normalize = ContrastiveNetwork(
-        input_dim=args.input_dim,
-        hidden_dims=HIDDEN_DIMS,
-        normalize_output=NORMALIZE_OUTPUT,
-        esm_layer=args.esm_layer,
-        esm_only=True,
-        normalize_to_wt=False
-    ).to(device)
-    print('og esm embeddings evaluation - main batch type - not normalize to wt')
-    original_test_loss, original_test_similarities, original_test_labels, original_test_dists, original_test_quartiles, original_test_projections = evaluate_model(
-        esm_only_model_no_normalize, loss_fn, test_loader, device
-    )
-    original_test_acc, original_test_precision, original_test_recall, original_test_f1 = contrastive_metrics(original_test_similarities, original_test_labels)
-    original_test_auc = roc_auc_score(original_test_labels, original_test_similarities)
-
-    print('og esm embeddings evaluation - gene-aware batch type - not normalize to wt')
-    original_gene_aware_test_loss, original_gene_aware_test_similarities, original_gene_aware_test_labels, original_gene_aware_test_dists, original_gene_aware_test_quartiles, original_gene_aware_test_projections = evaluate_model(
-        esm_only_model_no_normalize, loss_fn, gene_aware_test_loader, device
-    )
-    original_gene_aware_test_acc, original_gene_aware_test_precision, original_gene_aware_test_recall, original_gene_aware_test_f1 = contrastive_metrics(original_gene_aware_test_similarities, original_gene_aware_test_labels)
-    original_gene_aware_test_auc = roc_auc_score(original_gene_aware_test_labels, original_gene_aware_test_similarities)
-
-    """
-    print(f"\nTest Metrics:")
+    print(f"\nKNN Test Metrics:")
     #print(f"  Loss: {test_loss:.4f}")
     print(f"  Accuracy: {knn_acc:.4f}")
     print(f"  Precision: {knn_precision:.4f}")
     print(f"  Recall: {knn_recall:.4f}")
     print(f"  F1: {knn_f1:.4f}")
+    print(f"  AUC: {knn_auc:.4f}")
+    print()
+
+    print(f"\nRidge Test Metrics:")
+    #print(f"  Loss: {test_loss:.4f}")
+    print(f"  Accuracy: {ridge_acc:.4f}")
+    print(f"  Precision: {ridge_precision:.4f}")
+    print(f"  Recall: {ridge_recall:.4f}")
+    print(f"  F1: {ridge_f1:.4f}")
+    print(f"  AUC: {ridge_auc:.4f}")
+    print()
+
+    print(f"\nContrastive Similarity Metrics:")
+    print(f"  Accuracy: {val_acc:.4f}")
+    print(f"  Precision: {val_precision:.4f}")
+    print(f"  Recall: {val_recall:.4f}")
+    print(f"  F1: {val_f1:.4f}")
     print(f"  AUC: {val_auc:.4f}")
+    print()
 
 
 
     with open(RESULTS_FILE, 'a') as f:
-        f.write(f'{RUN_NAME},{knn_acc},{knn_precision},{knn_recall},{knn_f1},{val_auc}\n')
-        #f.write(f'{RUN_NAME}_gene_aware_eval,-,{gene_aware_test_acc},{gene_aware_test_precision},{gene_aware_test_recall},{gene_aware_test_f1},{gene_aware_test_auc}\n')
-        #f.write(f'{RUN_NAME}_og_esm_normalize,-,{original_normalize_test_acc},{original_normalize_test_precision},{original_normalize_test_recall},{original_normalize_test_f1},{original_normalize_test_auc}\n')
-        #f.write(f'{RUN_NAME}_og_esm_normalize_gene_aware,-,{original_normalize_gene_aware_test_acc},{original_normalize_gene_aware_test_precision},{original_normalize_gene_aware_test_recall},{original_normalize_gene_aware_test_f1},{original_normalize_gene_aware_test_auc}\n')
-        #f.write(f'{RUN_NAME}_og_esm_no_normalize,-,{original_test_acc},{original_test_precision},{original_test_recall},{original_test_f1},{original_test_auc}\n')
-        #f.write(f'{RUN_NAME}_og_esm_no_normalize_gene_aware,-,{original_gene_aware_test_acc},{original_gene_aware_test_precision},{original_gene_aware_test_recall},{original_gene_aware_test_f1},{original_gene_aware_test_auc}\n')
+        f.write(f'{RUN_NAME}_knn,{knn_acc},{knn_precision},{knn_recall},{knn_f1},{knn_auc}\n')
+        f.write(f'{RUN_NAME}_ridge,{ridge_acc},{ridge_precision},{ridge_recall},{ridge_f1},{ridge_auc}\n')
+        f.write(f'{RUN_NAME}_contrastive,{val_acc},{val_precision},{val_recall},{val_f1},{val_auc}\n')
 
 
     print(f"\nDistance Statistics:")
@@ -1810,8 +1769,8 @@ def main():
     print(f"  Min: {np.min(test_dists):.4f}")
     print(f"  Max: {np.max(test_dists):.4f}")
 
-    print("\n=== Final Distance Clustering ===")
-    plot_distance_clustering(test_dists, test_labels, "Final Test Set", final=True)
+    #print("\n=== Final Distance Clustering ===")
+    #plot_distance_clustering(test_dists, test_labels, "Final Test Set", final=True)
 
     """
 
@@ -1833,7 +1792,8 @@ def main():
                               "Projected Embeddings (DMS Colored)")
     """
 
-    h5_utils.close_h5()
+    ESMEmbeddingLoader.close_h5()
+    OHEEmbeddingLoader.close_h5()
 
 if __name__ == '__main__':
     main()
