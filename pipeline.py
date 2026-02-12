@@ -275,8 +275,11 @@ def load_embeddings_h5(sequences, embedding_loader, embedding_type, mutants=None
     
     if len(missing_seqs) > 0:
         if embedding_type == 'esm':
+            if args.use_lora:
+                print('WARNING: while finetuning, we should not be generating new embeddings from this function: this probably means we are missing pre-computed WT embeddings and they are being generated here with the current (finetuned) model, not the original ESM model')
             missing_embeddings = esm_batch(missing_seqs)
         elif embedding_type == 'ohe':
+            print('generating ohe embeddings')
             all_embeddings = get_ohe_features(wt_seqs, mutants)
             missing_embeddings = torch.Tensor(all_embeddings[missing_indices])
         
@@ -790,7 +793,7 @@ def evaluate_model(projection_net, loss_fn, dataloader, device):
             all_labels.extend(labels)
             all_quartiles.extend(quartiles)
 
-            if i>args.eval_batches_during_training:
+            if i>args.eval_batches_during_training and args.eval_batches_during_training != 999999:
                 if dataloader.shuffle == False:
                     raise ValueError("should not stop evaluation early on a non-shuffled dataloader! - otherwise we miss some genes entirely")
                 break
@@ -1373,7 +1376,6 @@ def train(projection_net, loss_fn, train_loader, test_loader, optimizer, device)
     for epoch in range(NUM_EPOCHS):
         print(f"\nEpoch {epoch+1}/{NUM_EPOCHS}")
         #train
-        projection_net.train()
         if args.use_lora and esm_model is not None:
             esm_model.train()
 
@@ -1387,6 +1389,7 @@ def train(projection_net, loss_fn, train_loader, test_loader, optimizer, device)
         num_batches = 0
 
         for batch_idx, batch in enumerate(tqdm(train_loader, desc="Training")):
+            projection_net.train()
             if batch_idx % args.gradient_accumulation_steps == 0:
                 optimizer.zero_grad()
                 if esm_optimizer is not None:
@@ -1472,6 +1475,7 @@ def train(projection_net, loss_fn, train_loader, test_loader, optimizer, device)
         print(f"  Val Loss: {val_loss:.4f}, Val Acc: {val_acc:.4f}")
         print(f"  Patience: {patience_counter}/{PATIENCE}")
         print(f"  Train AUC: {train_auc:.4f}, Val AUC: {val_auc:.4f}")
+
         if USE_LEARNABLE:
             print(f"  Alpha: {loss_fn.alpha.item():.4f}, Beta: {loss_fn.beta.item():.4f}")
 
@@ -1662,7 +1666,7 @@ def main():
             raise ValueError("Model checkpoint contains ESM LoRA state dict but ESM model is not initialized - make sure --use_lora is set even if just evaluating")
         print(" Model loaded successfully")
     else:
-        best_model_state, best_esm_model_state = train(projection_net, loss_fn, train_loader, test_loader_shuffled, optimizer, device)
+        best_model_state, best_esm_model_state = train(projection_net, loss_fn, train_loader, test_loader, optimizer, device)
         print("\n Restoring best model...")
         projection_net.load_state_dict(best_model_state)
         if args.use_lora:
@@ -1685,8 +1689,29 @@ def main():
     train_loss, train_similarities, train_labels, train_dists, train_quartiles, train_projections = evaluate_model(
         projection_net, loss_fn, train_loader, device
     )
+    val_acc, val_precision, val_recall, val_f1 = contrastive_metrics(test_similarities, test_labels)
+    train_acc, train_precision, train_recall, train_f1 = contrastive_metrics(train_similarities, train_labels)
+    train_auc = roc_auc_score(train_labels, train_similarities)
+    val_auc = roc_auc_score(test_labels, test_similarities)
+
+    knn_acc, knn_precision, knn_recall, knn_f1, knn_auc = knn_metrics(train_projections, train_quartiles, test_projections, test_quartiles)
+    ridge_acc, ridge_precision, ridge_recall, ridge_f1, ridge_auc = ridge_metrics(train_projections, train_quartiles, test_projections, test_quartiles) #would have to split val projections by position
+
+    #wandb log
+    wandb.log({
+        'avg_val_loss': test_loss,
+        'train_similarity_acc': train_acc,
+        'val_similarity_acc': val_acc,
+        'train_similarity_auc': train_auc,
+        'val_similarity_auc': val_auc,
+        'knn_acc': knn_acc,
+        'knn_auc': knn_auc,
+        'ridge_acc': ridge_acc,
+        'ridge_auc': ridge_auc
+    })
+
     #test_acc, test_precision, test_recall, test_f1 = contrastive_metrics(test_similarities, test_labels)
-    knn_acc, knn_precision, knn_recall, knn_f1 = knn_metrics(train_projections, train_quartiles, test_projections, test_quartiles)
+    
 
     test_auc = roc_auc_score(test_labels, test_similarities) #auc based on similarities
 
@@ -1766,12 +1791,12 @@ def main():
     print(f"  Precision: {knn_precision:.4f}")
     print(f"  Recall: {knn_recall:.4f}")
     print(f"  F1: {knn_f1:.4f}")
-    print(f"  AUC: {test_auc:.4f}")
+    print(f"  AUC: {val_auc:.4f}")
 
 
 
     with open(RESULTS_FILE, 'a') as f:
-        f.write(f'{RUN_NAME},{knn_acc},{knn_precision},{knn_recall},{knn_f1},{test_auc}\n')
+        f.write(f'{RUN_NAME},{knn_acc},{knn_precision},{knn_recall},{knn_f1},{val_auc}\n')
         #f.write(f'{RUN_NAME}_gene_aware_eval,-,{gene_aware_test_acc},{gene_aware_test_precision},{gene_aware_test_recall},{gene_aware_test_f1},{gene_aware_test_auc}\n')
         #f.write(f'{RUN_NAME}_og_esm_normalize,-,{original_normalize_test_acc},{original_normalize_test_precision},{original_normalize_test_recall},{original_normalize_test_f1},{original_normalize_test_auc}\n')
         #f.write(f'{RUN_NAME}_og_esm_normalize_gene_aware,-,{original_normalize_gene_aware_test_acc},{original_normalize_gene_aware_test_precision},{original_normalize_gene_aware_test_recall},{original_normalize_gene_aware_test_f1},{original_normalize_gene_aware_test_auc}\n')

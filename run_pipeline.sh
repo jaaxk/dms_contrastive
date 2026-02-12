@@ -2,7 +2,7 @@
 #SBATCH -p gpu4_dev
 #SBATCH --gres=gpu:1
 #SBATCH --time=4:00:00
-#SBATCH --mem=250G
+#SBATCH --mem=25G
 #SBATCH --output=logs/%j_lora.out
 #SBATCH --job-name=dms_cl_sp
 
@@ -13,10 +13,10 @@ BASE_DATA_PATH="/gpfs/scratch/jv2807/dms_data"
 
 EMBEDDING_LAYER="layer33_mean"
 
-for COARSE_SELECTION_TYPE in "OrganismalFitness" "Binding" "Activity" "Stability" "Expression" ; do
+for COARSE_SELECTION_TYPE in "Stability" "OrganismalFitness" "Binding" "Activity" "Expression" ; do
     echo "Running ${COARSE_SELECTION_TYPE} ${EMBEDDING_LAYER}"
 
-    RUN_NAME="650M_splitbygene_lora2_${COARSE_SELECTION_TYPE}_${EMBEDDING_LAYER}"
+    RUN_NAME="650M_splitbygene_nolora_test1_${COARSE_SELECTION_TYPE}_${EMBEDDING_LAYER}"
 
     python -u pipeline.py --run_name $RUN_NAME \
         --data_path $BASE_DATA_PATH/datasets/${COARSE_SELECTION_TYPE}.csv \
@@ -29,15 +29,15 @@ for COARSE_SELECTION_TYPE in "OrganismalFitness" "Binding" "Activity" "Stability
         --batch_size 4 \
         --gradient_accumulation_steps 8 \
         --patience 10 \
-        --eval_batches_during_training 2000 \
         --dropout 0.0 \
         --metadata_path $BASE_DATA_PATH/datasets/DMS_substitutions.csv \
-        --num_epochs 10 \
-        --normalize_to_wt \
+        --num_epochs 3 \
         --ohe_baseline \
+        --normalize_to_wt \
         --split_by_gene \
-        --use_lora
+        --split_file /gpfs/home/jv2807/dms_contrastive/results/650M_splitbygene_lora2_${COARSE_SELECTION_TYPE}_layer33_mean/data_split.json
 
+    exit 1
 done
 
 #         --model_path /gpfs/scratch/jvaska/brandes_lab/results/650M_NORM_SAVE_${COARSE_SELECTION_TYPE}_layer33_mean/projection_head.pt

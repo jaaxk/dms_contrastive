@@ -19,7 +19,7 @@ for i in "${!SELECTION_TYPES[@]}"; do
     COARSE_SELECTION_TYPE="${SELECTION_TYPES[$i]}"
     echo "Launching ${COARSE_SELECTION_TYPE} on GPU ${i}"
     
-    RUN_NAME="650M_splitbygene_lora2_${COARSE_SELECTION_TYPE}_${EMBEDDING_LAYER}"
+    RUN_NAME="650M_splitbygene_NWT_nolora_fullevalbatches_${COARSE_SELECTION_TYPE}_${EMBEDDING_LAYER}"
     
     CUDA_VISIBLE_DEVICES=$i python -u pipeline.py --run_name $RUN_NAME \
         --data_path $BASE_DATA_PATH/datasets/${COARSE_SELECTION_TYPE}.csv \
@@ -32,17 +32,20 @@ for i in "${!SELECTION_TYPES[@]}"; do
         --batch_size 4 \
         --gradient_accumulation_steps 8 \
         --patience 10 \
-        --eval_batches_during_training 2000 \
         --dropout 0.0 \
         --metadata_path $BASE_DATA_PATH/datasets/DMS_substitutions.csv \
         --num_epochs 10 \
-        --normalize_to_wt \
         --ohe_baseline \
-        --split_by_gene \
+        --normalize_to_wt \
         --use_lora \
+        --eval_batches_during_training 2000 \
+        --split_by_gene \
+        --split_file /gpfs/home/jv2807/dms_contrastive/results/650M_splitbygene_lora2_${COARSE_SELECTION_TYPE}_layer33_mean/data_split.json \
         > logs/${SLURM_JOB_ID}_${COARSE_SELECTION_TYPE}.out 2>&1 &
 done
 
 wait
+
+
 
 echo "All tasks completed"
