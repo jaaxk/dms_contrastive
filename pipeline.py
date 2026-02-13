@@ -8,6 +8,7 @@ Original file is located at
 """
 
 import pandas as pd
+import math
 import numpy as np
 import torch
 import torch.nn as nn
@@ -105,6 +106,7 @@ def parse_args():
     parser.add_argument('--wandb_project', type=str, default='dms-contrastive', help='Weights and Biases project name')
     parser.add_argument('--wandb_entity', type=str, default='jack-vaska-nyu-langone-health', help='Weights and Biases entity name')
     parser.add_argument('--eval_steps', type=int, default=None, help='Save model and eval metrics every N steps (batches), if not specified, will evaluate ~5 times per epoch')
+    parser.add_argument('--eval_per_epoch', type=int, default=None, help='Number of times to evaluate per epoch (overrides --eval_steps if specified)')
 
     args = parser.parse_args()
     print(args)
@@ -185,7 +187,7 @@ if args.ohe_baseline:
 ESMEmbeddingLoader = None
 OHEEmbeddingLoader = None
 
-if args.model_path is not None:
+if args.model_path is not None and args.split_file is None:
     DATA_SPLIT_PATH = f'{os.path.dirname(args.model_path)}/data_split.json'
     if not os.path.exists(DATA_SPLIT_PATH):
         raise ValueError(f"Data split file not found at {DATA_SPLIT_PATH}, cannot load embeddings for evaluation - bypass this if you want to evaluate a model on a different split (BUT BE AWARE OF DATA LEAKAGE!)")
@@ -275,6 +277,8 @@ def load_embeddings_h5(sequences, embedding_loader, embedding_type, mutants=None
         raise ValueError("embedding_type must be 'esm' or 'ohe'")
         
     embeddings, missing_seqs, missing_indices = embedding_loader.load_embeddings(sequences)
+    #print(f'len embeddings: {len(embeddings)}')
+    #print(f'len missing seqs: {len(missing_seqs)}')
     assert len(missing_seqs) == len(missing_indices)
     
     if len(missing_seqs) > 0:
@@ -431,7 +435,20 @@ class DataLoader():
         }
 
     def __len__(self):
-        return len(self.indices) // self.batch_size
+        if self.gene_aware:
+            total_batches = 0
+            half_batch = self.batch_size // 2
+            for quartile_dict in self.gene_groups.values():
+                high = quartile_dict['high']
+                low = quartile_dict['low']
+                total_batches += min(len(high)//half_batch,
+                                    len(low)//half_batch)
+            return total_batches
+        else:
+            half_batch = self.batch_size // 2
+            high = [i for i,q in enumerate(self.dataset.quartiles) if q=='high']
+            low = [i for i,q in enumerate(self.dataset.quartiles) if q=='low']
+            return min(len(high), len(low)) // half_batch
 
 class ContrastiveNetwork(nn.Module):
     def __init__(self, input_dim=1280, hidden_dims=[512, 256, 128], normalize_output=False, esm_layer=33, esm_only=False, normalize_to_wt=False):
@@ -729,8 +746,8 @@ def create_train_test_split(df, split_by_gene=True, split_by_position=None, test
 
         #save split to json
         split_to_sequences = {
-            'train_sequences': train_sequences,
-            'test_sequences': test_sequences
+            'train_sequences': list(train_sequences),
+            'test_sequences': list(test_sequences)
         }
         with open(f'{RESULTS_DIR}/data_split.json', 'w') as f:
             json.dump(split_to_sequences, f)
@@ -1374,14 +1391,21 @@ def train(projection_net, loss_fn, train_loader, test_loader, optimizer, device)
 
     print(f'Batches: {len(train_loader)}')
     print(f'Effective batch size (after gradient accumulation): {train_loader.batch_size * args.gradient_accumulation_steps}')
-    effective_batches = len(train_loader) // args.gradient_accumulation_steps
-    if args.eval_steps is None:
-        args.eval_steps = effective_batches // 5  # Default to evaluating 5 times per epoch
+    effective_batches = math.floor(len(train_loader) / args.gradient_accumulation_steps)
+
+    if args.eval_per_epoch is not None:
+        args.eval_steps = max(1, math.floor(effective_batches / args.eval_per_epoch))  # Override eval_steps if eval_per_epoch is specified
+    elif args.eval_steps is None:
+        args.eval_steps = max(1, math.floor(effective_batches / 5))  # Default to evaluating 5 times per epoch if eval_steps is not set
+
     print('Effective batches (after gradient accumulation):', effective_batches)
     print(f'Evaluating every {args.eval_steps} effective batches')
-    print(f'Evaluations per epoch: {effective_batches // args.eval_steps}')
-    if args.patience < (effective_batches // args.eval_steps):
-        print(f'**WARNING: patience ({args.patience}) is less than the number of evaluations per epoch ({effective_batches // args.eval_steps}), which may lead to early stopping before one full epoch is completed.')
+    evals_per_epoch = effective_batches // args.eval_steps
+    if evals_per_epoch < 1:
+        raise ValueError(f'Must evaluate >=1 time per epoch')
+    print(f'Evaluations per epoch: {evals_per_epoch}')
+    if args.patience < (evals_per_epoch):
+        print(f'**WARNING: patience ({args.patience}) is less than the number of evaluations per epoch ({evals_per_epoch}), which may lead to early stopping before one full epoch is completed.')
 
     for epoch in range(NUM_EPOCHS):
         print(f"\nEpoch {epoch+1}/{NUM_EPOCHS}")
@@ -1435,7 +1459,7 @@ def train(projection_net, loss_fn, train_loader, test_loader, optimizer, device)
                 
                 global_step += 1
 
-                if global_step % args.eval_steps == 0:
+                if (global_step) % args.eval_steps == 0:
                     #eval
                     val_loss, val_similarities, val_labels_epoch, val_dists, val_quartiles, val_projections = evaluate_model(
                         projection_net, loss_fn, test_loader, device
@@ -1676,26 +1700,15 @@ def main():
         if checkpoint.get('esm_model_state_dict') is not None:
             print(" Loading ESM LoRA adapter state")
             esm_model.load_state_dict(checkpoint['esm_model_state_dict']) #load whole model state dict, but only the adapter weights will be updated since the rest of the model is frozen
-        elif esm_model is None:
-            raise ValueError("Model checkpoint contains ESM LoRA state dict but ESM model is not initialized - make sure --use_lora is set even if just evaluating")
         print(" Model loaded successfully")
-    else:
+    elif args.num_epochs != 0:
         best_model_state, best_esm_model_state = train(projection_net, loss_fn, train_loader, test_loader, optimizer, device)
         print("\n Restoring best model...")
         projection_net.load_state_dict(best_model_state)
         if args.use_lora:
             esm_model.load_state_dict(best_esm_model_state)
 
-    if args.ohe_baseline:
-        print("\n=== BASELINE vs PROJECTION EVALUATION ===")
-        #llr_threshold_performance(gene_aware_test_loader)
-        #ohe_llr_baseline(loss_fn, gene_aware_test_loader)
-        if args.test_same_gene_batch:
-            gene_aware_test_loader = test_loader
-        else:
-            gene_aware_test_loader = DataLoader(test_dataset, batch_size=BATCH_SIZE, gene_to_wt = gene_to_wt, shuffle=False, gene_aware=True)
-        classification_comparison_by_train_size(projection_net, gene_aware_test_loader, device, train_sizes=[.01, .025, .05, .1, .2, .4, .6, .8, 1.0])
-        return
+    
 
     print("\n=== FINAL EVALUATION ===")
 
@@ -1757,10 +1770,21 @@ def main():
 
 
 
-    with open(RESULTS_FILE, 'a') as f:
-        f.write(f'{RUN_NAME}_knn,{knn_acc},{knn_precision},{knn_recall},{knn_f1},{knn_auc}\n')
-        f.write(f'{RUN_NAME}_ridge,{ridge_acc},{ridge_precision},{ridge_recall},{ridge_f1},{ridge_auc}\n')
-        f.write(f'{RUN_NAME}_contrastive,{val_acc},{val_precision},{val_recall},{val_f1},{val_auc}\n')
+    with open(RESULTS_FILE, 'a') as f: #run_name, test_loss, test_acc, test_precision, test_recall, test_f1, test_auc
+        f.write(f'{RUN_NAME}_knn,-,{knn_acc},{knn_precision},{knn_recall},{knn_f1},{knn_auc}\n')
+        f.write(f'{RUN_NAME}_ridge,-,{ridge_acc},{ridge_precision},{ridge_recall},{ridge_f1},{ridge_auc}\n')
+        f.write(f'{RUN_NAME}_contrastive,-,{val_acc},{val_precision},{val_recall},{val_f1},{val_auc}\n')
+
+    if args.ohe_baseline:
+        print("\n=== BASELINE vs PROJECTION EVALUATION ===")
+        #llr_threshold_performance(gene_aware_test_loader)
+        #ohe_llr_baseline(loss_fn, gene_aware_test_loader)
+        #if args.test_same_gene_batch:
+        #    gene_aware_test_loader = test_loader
+        #else:
+        gene_aware_test_loader = DataLoader(test_dataset, batch_size=64, gene_to_wt = gene_to_wt, shuffle=False, gene_aware=True)
+        classification_comparison_by_train_size(projection_net, gene_aware_test_loader, device, train_sizes=[.01, .025, .05, .1, .2, .4, .6, .8, 1.0])
+        
 
 
     print(f"\nDistance Statistics:")

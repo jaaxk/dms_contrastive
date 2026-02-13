@@ -31,14 +31,16 @@ for i in "${!SELECTION_TYPES[@]}"; do
         --input_dim 1280 \
         --batch_size 4 \
         --gradient_accumulation_steps 8 \
-        --patience 10 \
+        --patience 4 \
+        --eval_per_epoch 2 \
         --dropout 0.0 \
         --metadata_path $BASE_DATA_PATH/datasets/DMS_substitutions.csv \
-        --num_epochs 10 \
+        --num_epochs 5 \
         --ohe_baseline \
+        --train_same_gene_batch \
+        --test_same_gene_batch \
         --normalize_to_wt \
         --use_lora \
-        --eval_batches_during_training 2000 \
         --split_by_gene \
         --split_file /gpfs/home/jv2807/dms_contrastive/results/650M_splitbygene_lora2_${COARSE_SELECTION_TYPE}_layer33_mean/data_split.json \
         > logs/${SLURM_JOB_ID}_${COARSE_SELECTION_TYPE}.out 2>&1 &
