@@ -13,10 +13,10 @@ BASE_DATA_PATH="/gpfs/scratch/jv2807/dms_data"
 
 EMBEDDING_LAYER="layer33_mean"
 
-for COARSE_SELECTION_TYPE in "Stability" "OrganismalFitness" "Binding" "Activity" "Expression" ; do
+for COARSE_SELECTION_TYPE in "Stability" "Expression" ; do
     echo "Running ${COARSE_SELECTION_TYPE} ${EMBEDDING_LAYER}"
 
-    RUN_NAME="650M_splitbygene_nolora_NWT1_${COARSE_SELECTION_TYPE}"
+    RUN_NAME="650M_NWT_lora_eval_${COARSE_SELECTION_TYPE}"
 
     python -u pipeline.py --run_name $RUN_NAME \
         --data_path $BASE_DATA_PATH/datasets/${COARSE_SELECTION_TYPE}.csv \
@@ -28,18 +28,23 @@ for COARSE_SELECTION_TYPE in "Stability" "OrganismalFitness" "Binding" "Activity
         --input_dim 1280 \
         --batch_size 4 \
         --gradient_accumulation_steps 8 \
-        --patience 5 \
+        --patience 4 \
+        --eval_per_epoch 2 \
         --dropout 0.0 \
         --metadata_path $BASE_DATA_PATH/datasets/DMS_substitutions.csv \
         --num_epochs 0 \
         --ohe_baseline \
-        --normalize_to_wt \
-        --split_by_gene \
-        --eval_per_epoch 1 \
-        --split_file /gpfs/home/jv2807/dms_contrastive/results/650M_splitbygene_lora2_${COARSE_SELECTION_TYPE}_layer33_mean/data_split.json \
         --train_same_gene_batch \
         --test_same_gene_batch \
-        --model_path /gpfs/home/jv2807/dms_contrastive/results/650M_splitbygene_nolora_NWT1_train_same_gene_batch_test_same_gene_batch_${COARSE_SELECTION_TYPE}/model.pt
+        --normalize_to_wt \
+        --use_lora \
+        --lora_alpha 32 \
+        --esm_lr .000005 \
+        --lora_target_modules query key value \
+        --split_by_gene \
+        --split_file /gpfs/home/jv2807/dms_contrastive/results/650M_splitbygene_lora2_${COARSE_SELECTION_TYPE}_layer33_mean/data_split.json \
+        --model_path /gpfs/home/jv2807/dms_contrastive/results/650M_splitbygene_NWT_lora_${COARSE_SELECTION_TYPE}_layer33_mean/model.pt \
+        --ohe_baseline
 
     exit 1
     

@@ -33,7 +33,6 @@ import json
 import re
 from contextlib import redirect_stdout, redirect_stderr
 from scripts.metrics import contrastive_metrics, kmeans_metrics, logreg_metrics, knn_metrics, ridge_metrics
-import wandb
 
 warnings.filterwarnings('ignore')
 
@@ -1364,8 +1363,9 @@ def train(projection_net, loss_fn, train_loader, test_loader, optimizer, device)
     Create separate optimizer for ESM LoRA if needed
     """
 
-    #Weights and Biases tracking:
+    print('Training...')
     from transformers import get_cosine_schedule_with_warmup
+    import wandb
     run = wandb.init(project=args.wandb_project, name=RUN_NAME, entity=args.wandb_entity, config=args.__dict__)
     
     train_losses = []
@@ -1725,79 +1725,80 @@ def main():
 
     
 
-    print("\n=== FINAL EVALUATION ===")
+        print("\n=== FINAL EVALUATION ===")
 
-    #different-gene batch evaluation
-    print('main batch evaluation')
-    test_loss, test_similarities, test_labels, test_dists, test_quartiles, test_projections = evaluate_model(
-        projection_net, loss_fn, test_loader, device
-    )
-    train_loss, train_similarities, train_labels, train_dists, train_quartiles, train_projections = evaluate_model(
-        projection_net, loss_fn, train_loader, device
-    )
-    val_acc, val_precision, val_recall, val_f1 = contrastive_metrics(test_similarities, test_labels)
-    train_acc, train_precision, train_recall, train_f1 = contrastive_metrics(train_similarities, train_labels)
-    train_auc = roc_auc_score(train_labels, train_similarities)
-    val_auc = roc_auc_score(test_labels, test_similarities)
+        #different-gene batch evaluation
+        print('main batch evaluation')
+        test_loss, test_similarities, test_labels, test_dists, test_quartiles, test_projections = evaluate_model(
+            projection_net, loss_fn, test_loader, device
+        )
+        train_loss, train_similarities, train_labels, train_dists, train_quartiles, train_projections = evaluate_model(
+            projection_net, loss_fn, train_loader, device
+        )
+        val_acc, val_precision, val_recall, val_f1 = contrastive_metrics(test_similarities, test_labels)
+        train_acc, train_precision, train_recall, train_f1 = contrastive_metrics(train_similarities, train_labels)
+        train_auc = roc_auc_score(train_labels, train_similarities)
+        val_auc = roc_auc_score(test_labels, test_similarities)
 
-    knn_acc, knn_precision, knn_recall, knn_f1, knn_auc = knn_metrics(train_projections, train_quartiles, test_projections, test_quartiles)
-    ridge_acc, ridge_precision, ridge_recall, ridge_f1, ridge_auc = ridge_metrics(train_projections, train_quartiles, test_projections, test_quartiles) #would have to split val projections by position
+        knn_acc, knn_precision, knn_recall, knn_f1, knn_auc = knn_metrics(train_projections, train_quartiles, test_projections, test_quartiles)
+        ridge_acc, ridge_precision, ridge_recall, ridge_f1, ridge_auc = ridge_metrics(train_projections, train_quartiles, test_projections, test_quartiles) #would have to split val projections by position
 
-    #wandb log
-    wandb.log({
-        'avg_val_loss': test_loss,
-        'train_similarity_acc': train_acc,
-        'val_similarity_acc': val_acc,
-        'train_similarity_auc': train_auc,
-        'val_similarity_auc': val_auc,
-        'knn_acc': knn_acc,
-        'knn_auc': knn_auc,
-        'ridge_acc': ridge_acc,
-        'ridge_auc': ridge_auc
-    })
-
-
-    print(f"\nKNN Test Metrics:")
-    #print(f"  Loss: {test_loss:.4f}")
-    print(f"  Accuracy: {knn_acc:.4f}")
-    print(f"  Precision: {knn_precision:.4f}")
-    print(f"  Recall: {knn_recall:.4f}")
-    print(f"  F1: {knn_f1:.4f}")
-    print(f"  AUC: {knn_auc:.4f}")
-    print()
-
-    print(f"\nRidge Test Metrics:")
-    #print(f"  Loss: {test_loss:.4f}")
-    print(f"  Accuracy: {ridge_acc:.4f}")
-    print(f"  Precision: {ridge_precision:.4f}")
-    print(f"  Recall: {ridge_recall:.4f}")
-    print(f"  F1: {ridge_f1:.4f}")
-    print(f"  AUC: {ridge_auc:.4f}")
-    print()
-
-    print(f"\nContrastive Similarity Metrics:")
-    print(f"  Accuracy: {val_acc:.4f}")
-    print(f"  Precision: {val_precision:.4f}")
-    print(f"  Recall: {val_recall:.4f}")
-    print(f"  F1: {val_f1:.4f}")
-    print(f"  AUC: {val_auc:.4f}")
-    print()
+        #wandb log
+        wandb.log({
+            'avg_val_loss': test_loss,
+            'train_similarity_acc': train_acc,
+            'val_similarity_acc': val_acc,
+            'train_similarity_auc': train_auc,
+            'val_similarity_auc': val_auc,
+            'knn_acc': knn_acc,
+            'knn_auc': knn_auc,
+            'ridge_acc': ridge_acc,
+            'ridge_auc': ridge_auc
+        })
 
 
+        print(f"\nKNN Test Metrics:")
+        #print(f"  Loss: {test_loss:.4f}")
+        print(f"  Accuracy: {knn_acc:.4f}")
+        print(f"  Precision: {knn_precision:.4f}")
+        print(f"  Recall: {knn_recall:.4f}")
+        print(f"  F1: {knn_f1:.4f}")
+        print(f"  AUC: {knn_auc:.4f}")
+        print()
 
-    with open(RESULTS_FILE, 'a') as f: #run_name, test_loss, test_acc, test_precision, test_recall, test_f1, test_auc
-        f.write(f'{RUN_NAME}_knn,-,{knn_acc},{knn_precision},{knn_recall},{knn_f1},{knn_auc}\n')
-        f.write(f'{RUN_NAME}_ridge,-,{ridge_acc},{ridge_precision},{ridge_recall},{ridge_f1},{ridge_auc}\n')
-        f.write(f'{RUN_NAME}_contrastive,-,{val_acc},{val_precision},{val_recall},{val_f1},{val_auc}\n')
+        print(f"\nRidge Test Metrics:")
+        #print(f"  Loss: {test_loss:.4f}")
+        print(f"  Accuracy: {ridge_acc:.4f}")
+        print(f"  Precision: {ridge_precision:.4f}")
+        print(f"  Recall: {ridge_recall:.4f}")
+        print(f"  F1: {ridge_f1:.4f}")
+        print(f"  AUC: {ridge_auc:.4f}")
+        print()
+
+        print(f"\nContrastive Similarity Metrics:")
+        print(f"  Accuracy: {val_acc:.4f}")
+        print(f"  Precision: {val_precision:.4f}")
+        print(f"  Recall: {val_recall:.4f}")
+        print(f"  F1: {val_f1:.4f}")
+        print(f"  AUC: {val_auc:.4f}")
+        print()
+
+
+
+        with open(RESULTS_FILE, 'a') as f: #run_name, test_loss, test_acc, test_precision, test_recall, test_f1, test_auc
+            f.write(f'{RUN_NAME}_knn,-,{knn_acc},{knn_precision},{knn_recall},{knn_f1},{knn_auc}\n')
+            f.write(f'{RUN_NAME}_ridge,-,{ridge_acc},{ridge_precision},{ridge_recall},{ridge_f1},{ridge_auc}\n')
+            f.write(f'{RUN_NAME}_contrastive,-,{val_acc},{val_precision},{val_recall},{val_f1},{val_auc}\n')
 
     if args.ohe_baseline:
         print("\n=== BASELINE vs PROJECTION EVALUATION ===")
         #llr_threshold_performance(gene_aware_test_loader)
         #ohe_llr_baseline(loss_fn, gene_aware_test_loader)
-        #if args.test_same_gene_batch:
-        #    gene_aware_test_loader = test_loader
-        #else:
-        gene_aware_test_loader = DataLoader(test_dataset, batch_size=64, gene_to_wt = gene_to_wt, shuffle=False, gene_aware=True)
+        
+        if args.test_different_gene_batch:
+            gene_aware_test_loader = DataLoader(test_dataset, batch_size=BATCH_SIZE, gene_to_wt = gene_to_wt, shuffle=False, gene_aware=True)
+        else:
+            gene_aware_test_loader = test_loader
         classification_comparison_by_train_size(projection_net, gene_aware_test_loader, device, train_sizes=[.01, .025, .05, .1, .2, .4, .6, .8, 1.0])
         
 
