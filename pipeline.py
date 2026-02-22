@@ -1715,6 +1715,8 @@ def main():
         if checkpoint.get('esm_model_state_dict') is not None:
             print(" Loading ESM LoRA adapter state")
             esm_model.load_state_dict(checkpoint['esm_model_state_dict']) #load whole model state dict, but only the adapter weights will be updated since the rest of the model is frozen
+            esm_model.eval()
+        projection_net.eval()
         print(" Model loaded successfully")
     elif args.num_epochs != 0:
         best_model_state, best_esm_model_state = train(projection_net, loss_fn, train_loader, test_loader, optimizer, device)
@@ -1722,6 +1724,8 @@ def main():
         projection_net.load_state_dict(best_model_state)
         if args.use_lora:
             esm_model.load_state_dict(best_esm_model_state)
+            esm_model.eval()
+        projection_net.eval()
 
     
 
