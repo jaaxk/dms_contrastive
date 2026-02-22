@@ -87,6 +87,7 @@ def parse_args():
     parser.add_argument('--test_different_gene_batch', action='store_true')
     parser.add_argument('--train_same_gene_batch', action='store_true', help='for training, whether to use a gene-aware train loader that creates batches of variants from the same gene, rather than random batches - if --same_gene_batch is set, this is automatically set to True', default=False)
     parser.add_argument('--train_different_gene_batch', action='store_true')
+    parser.add_argument('--eval_regression', action='store_true')
 
     # LoRA finetuning args
     parser.add_argument('--use_lora', action='store_true', default=False, 
@@ -156,21 +157,21 @@ if args.normalize_to_wt:
         raise ValueError("--metadata_path must be specified if --normalize_to_wt is set")
     
 #init ESM model
-if args.model_path is None or args.use_lora:
-    esm_model = AutoModel.from_pretrained(args.model_name)
-    tokenizer = AutoTokenizer.from_pretrained(args.model_name)
+#if args.model_path is None or args.use_lora:
+esm_model = AutoModel.from_pretrained(args.model_name)
+tokenizer = AutoTokenizer.from_pretrained(args.model_name)
 
-    if args.use_lora:
-        from scripts.lora_utils import setup_lora_esm, save_lora_adapter, load_lora_adapter
-        esm_model = setup_lora_esm(esm_model, lora_rank=args.lora_rank, lora_alpha=args.lora_alpha, target_modules=args.lora_target_modules)
-        esm_model.train()
-    else:
-        esm_model.eval()
-
-    esm_model.to(device)
+if args.use_lora:
+    from scripts.lora_utils import setup_lora_esm, save_lora_adapter, load_lora_adapter
+    esm_model = setup_lora_esm(esm_model, lora_rank=args.lora_rank, lora_alpha=args.lora_alpha, target_modules=args.lora_target_modules)
+    esm_model.train()
 else:
-    esm_model = None
-    tokenizer = None
+    esm_model.eval()
+
+esm_model.to(device)
+#else:
+#    esm_model = None
+#    tokenizer = None
 
 
 if args.ohe_baseline:
@@ -287,7 +288,7 @@ def load_embeddings_h5(sequences, embedding_loader, embedding_type, mutants=None
                 print('WARNING: while finetuning, we should not be generating new embeddings from this function: this probably means we are missing pre-computed WT embeddings and they are being generated here with the current (finetuned) model, not the original ESM model')
             missing_embeddings = esm_batch(missing_seqs)
         elif embedding_type == 'ohe':
-            print('generating ohe embeddings')
+            #print('generating ohe embeddings')
             all_embeddings = get_ohe_features(wt_seqs, mutants)
             missing_embeddings = torch.Tensor(all_embeddings[missing_indices])
         
@@ -483,10 +484,10 @@ class ContrastiveNetwork(nn.Module):
         if args.use_lora:
             out = esm_batch(batch['sequences'])
         else:
-            out = batch['embeddings']
+            out = batch['embeddings'].to(device)
 
         if self.normalize_to_wt:
-            out = out - batch['wt_embeddings']
+            out = out - batch['wt_embeddings'].to(device)
 
         if self.esm_only:
             x = out
@@ -581,6 +582,7 @@ class ContrastiveLoss(nn.Module):
 def load_and_preprocess_data(data_path):
     print(f"Loading data from {data_path}")
     df = pd.read_csv(data_path)
+    original_length = len(df)
 
     df = df.dropna(subset=['DMS_score', 'mutated_sequence', 'filename'])
 
@@ -598,17 +600,24 @@ def load_and_preprocess_data(data_path):
             print(f"Skipping gene {gene} (only {len(gene_df)} samples)")
             continue
 
-        #calculate quartiles for THIS gene
-        q25 = gene_df['DMS_score'].quantile(0.25)
-        q75 = gene_df['DMS_score'].quantile(0.75)
+        if args.eval_regression:
+            print('**WARNING, with eval_regression set, we should NOT be training or evaluating with BINARY objectives... high quartile now includes top TWO quartiles, and vice versa')
+            q50 = gene_df['DMS_score'].quantile(0.5)
+            top_75 = gene_df[gene_df['DMS_score'] >= q50].copy()
+            bottom_25 = gene_df[gene_df['DMS_score'] <= q50].copy()
+        else:
+            #calculate quartiles for THIS gene
+            q25 = gene_df['DMS_score'].quantile(0.25)
+            q75 = gene_df['DMS_score'].quantile(0.75)
 
-        #filter to top 75% and bottom 25% for this gene
-        top_75 = gene_df[gene_df['DMS_score'] >= q75].copy()
-        bottom_25 = gene_df[gene_df['DMS_score'] <= q25].copy()
-
+            #filter to top 75% and bottom 25% for this gene
+            top_75 = gene_df[gene_df['DMS_score'] >= q75].copy()
+            bottom_25 = gene_df[gene_df['DMS_score'] <= q25].copy()
+        
         #add quartile labels
         top_75['quartile'] = 'high'
         bottom_25['quartile'] = 'low'
+        
 
         #combine for this gene
         gene_processed = pd.concat([top_75, bottom_25], ignore_index=True)
@@ -620,7 +629,7 @@ def load_and_preprocess_data(data_path):
     combined_df = pd.concat(all_processed_dfs, ignore_index=True)
     print(f"\n Total processed samples: {len(combined_df)}")
 
-    return combined_df
+    return combined_df, original_length
 
 def create_train_test_split(df, split_by_gene=True, split_by_position=None, test_size=0.2):
     print("\nCreating train/test split...")
@@ -920,6 +929,35 @@ def calc_esm_llr_scores(wt_seq):
     return pd.DataFrame({'mut_name': raw_seq_results['wt_aa_and_pos'].str.replace(' ', '') + raw_seq_results['mut_aa'], \
             'esm_score': raw_seq_results['esm_score']}).set_index('mut_name')['esm_score']
 
+def positional_split(mutants):
+    MISSENSE_PATTERN = re.compile('([A-Z])(\d+)([A-Z])')
+    positions = []
+    position_indices = []  # Track which encodings have valid positions
+    for i, mut in enumerate(mutants):
+        matches = MISSENSE_PATTERN.findall(mut)
+        if not matches:
+            continue
+        ref_aa, pos, alt_aa = matches[0]
+        positions.append(int(pos))
+        position_indices.append(i)  # Remember which index this came from
+    if (len(mutants) - len(positions)) > 0:
+        print(f'Removed {len(mutants) - len(positions)} mutations that did not match the expected pattern')
+
+    unique_positions = list(set(positions))
+    np.random.shuffle(unique_positions)
+    train_positions = unique_positions[:int(len(unique_positions)*0.8)]
+    test_positions = unique_positions[int(len(unique_positions)*0.8):]
+
+    train_idx = []
+    test_idx = []
+    for idx, pos in zip(position_indices, positions):
+        if pos in train_positions:
+            train_idx.append(idx)
+        elif pos in test_positions:
+            test_idx.append(idx)
+
+    return train_idx, test_idx
+    
 
 def ohe_llr_baseline(batches, projection_net, train_size=None):
     #returns average of gene-level metrics across genes in dataloader: should be TEST loader because projection head is trained on train loader
@@ -935,7 +973,10 @@ def ohe_llr_baseline(batches, projection_net, train_size=None):
     current_gene = None
     
     for batch in tqdm(batches, desc="evaluating batches"):
-        quartiles = batch['quartiles']
+        if args.eval_regression:
+            dms_scores = batch['dms_scores']
+        else:
+            quartiles = batch['quartiles']
         ohe_features = batch['ohe_features'].cpu()
         projections = batch['projections']
         #projections = projection_net(batch).cpu().detach().numpy()
@@ -950,31 +991,8 @@ def ohe_llr_baseline(batches, projection_net, train_size=None):
                 should_evaluate=True
                 #train/test split
                 #POSITIONAL SPLIT
-                MISSENSE_PATTERN = re.compile('([A-Z])(\d+)([A-Z])')
-                positions = []
-                position_indices = []  # Track which encodings have valid positions
-                for i, mut in enumerate(gene_mutants):
-                    matches = MISSENSE_PATTERN.findall(mut)
-                    if not matches:
-                        continue
-                    ref_aa, pos, alt_aa = matches[0]
-                    positions.append(int(pos))
-                    position_indices.append(i)  # Remember which index this came from
-                if (len(gene_mutants) - len(positions)) > 0:
-                    print(f'Removed {len(gene_mutants) - len(positions)} mutations that did not match the expected pattern')
-
-                unique_positions = list(set(positions))
-                np.random.shuffle(unique_positions)
-                train_positions = unique_positions[:int(len(unique_positions)*0.8)]
-                test_positions = unique_positions[int(len(unique_positions)*0.8):]
-
-                train_idx = []
-                test_idx = []
-                for idx, pos in zip(position_indices, positions):
-                    if pos in train_positions:
-                        train_idx.append(idx)
-                    elif pos in test_positions:
-                        test_idx.append(idx)
+                train_idx, test_idx = positional_split(gene_mutants)
+                
 
                 #sample train set size if specified
                 if train_size is not None and len(train_idx) > train_size:
@@ -990,7 +1008,10 @@ def ohe_llr_baseline(batches, projection_net, train_size=None):
 
                 train_encodings = [gene_encodings[i] for i in train_idx]
                 train_projections = [gene_projections[i] for i in train_idx]
-                train_quartiles = [gene_quartiles[i] for i in train_idx]
+                if args.eval_regression:
+                    train_scores = [gene_scores[i] for i in train_idx]
+                else:
+                    train_quartiles = [gene_quartiles[i] for i in train_idx]
                 
                 if len(train_encodings) < 5:
                     print(f"Skipping gene {current_gene} for positional split due to insufficient training data")
@@ -1002,99 +1023,115 @@ def ohe_llr_baseline(batches, projection_net, train_size=None):
                 
                 test_encodings = [gene_encodings[i] for i in test_idx]
                 test_projections = [gene_projections[i] for i in test_idx]
-                test_quartiles = [gene_quartiles[i] for i in test_idx]
+                if args.eval_regression:
+                    test_scores = [gene_scores[i] for i in test_idx]
+                else:
+                    test_quartiles = [gene_quartiles[i] for i in test_idx]
                 #test_similarities = [gene_similarities[i] for i in test_idx]
                 #test_labels = [gene_labels[i] for i in test_idx]
 
-                if len(set(train_quartiles)) < 2 or len(set(test_quartiles)) < 2:
-                    print(f"Skipping gene {current_gene} for positional split due to only one quartile present in train or test set")
-                    should_evaluate=False
+                if not args.eval_regression:
+                    if len(set(train_quartiles)) < 2 or len(set(test_quartiles)) < 2:
+                        print(f"Skipping gene {current_gene} for positional split due to only one quartile present in train or test set")
+                        should_evaluate=False
 
                 #baseline results
                 if should_evaluate:
-                    results = {'knn': [], 'ridge': []}
-                    #knn eval:
-                    accuracy, precision, recall, f1, auc = knn_metrics(test_encodings, test_quartiles, train_encodings, train_quartiles)
-                    results['knn'] = [accuracy, precision, recall, f1, auc]
-                    #ridge eval:
-                    accuracy, precision, recall, f1, auc = ridge_metrics(train_encodings, train_quartiles, test_encodings, test_quartiles)
-                    results['ridge'] = [accuracy, precision, recall, f1, auc]
-                    gene_to_metrics['baseline']['positional_split'][current_gene] = results
+                    if args.eval_regression:
+                        #ridge baseline:
+                        mse = ridge_metrics(train_encodings, train_scores, test_encodings, test_scores)
+                        gene_to_metrics['baseline']['positional_split'][current_gene]['ridge'] = mse
 
-                    #projection results
-                    results = {'knn': [], 'ridge': []}
-                    #knn eval:
-                    accuracy, precision, recall, f1, auc = knn_metrics(test_projections, test_quartiles, train_projections, train_quartiles)
-                    results['knn'] = [accuracy, precision, recall, f1, auc]
-                    #ridge eval:
-                    accuracy, precision, recall, f1, auc = ridge_metrics(train_projections, train_quartiles, test_projections, test_quartiles)
-                    results['ridge'] = [accuracy, precision, recall, f1, auc]
-                    gene_to_metrics['projections']['positional_split'][current_gene] = results
+                        #ridge projections:
+                        mse = ridge_metrics(train_projections, train_scores, test_projections, test_scores)
+                        gene_to_metrics['projections']['positional_split'][current_gene]['ridge'] = mse
 
 
-                #RANDOM SPLIT 
-                indices = list(range(len(gene_encodings)))
-                np.random.shuffle(indices)
-                train_idx = indices[:int(len(indices)*0.8)]
-                test_idx = indices[int(len(indices)*0.8):]
-
-                #sample train set size if specified
-                if train_size is not None and len(train_idx) > train_size:
-                    if train_size <= 1: #handle fraction
-                        train_num = int(len(train_idx) * train_size)
                     else:
-                        train_num = train_size
-                    train_idx = np.random.choice(train_idx, size=train_num, replace=False).tolist()
+                        results = {'knn': [], 'ridge': []}
+                        #knn eval:
+                        accuracy, precision, recall, f1, auc = knn_metrics(test_encodings, test_quartiles, train_encodings, train_quartiles)
+                        results['knn'] = [accuracy, precision, recall, f1, auc]
+                        #ridge eval:
+                        accuracy, precision, recall, f1, auc = ridge_metrics(train_encodings, train_quartiles, test_encodings, test_quartiles)
+                        results['ridge'] = [accuracy, precision, recall, f1, auc]
+                        gene_to_metrics['baseline']['positional_split'][current_gene] = results
 
-                if len(train_idx) == 0 or len(test_idx) == 0:
-                    print(f"Skipping gene {current_gene} for random split due to insufficient data after sampling")
-                    should_evaluate=False
-                
-                train_encodings = [gene_encodings[i] for i in train_idx]
-                train_projections = [gene_projections[i] for i in train_idx]
-                train_quartiles = [gene_quartiles[i] for i in train_idx]
-                
-                if len(train_encodings) < 5:
-                    print(f"Skipping gene {current_gene} for random split due to insufficient training data")
-                    should_evaluate=False
-                #train_similarities = [gene_similarities[i] for i in train_idx]
-                #train_labels = [gene_labels[i] for i in train_idx]
-                
-                test_encodings = [gene_encodings[i] for i in test_idx]
-                test_projections = [gene_projections[i] for i in test_idx]
-                test_quartiles = [gene_quartiles[i] for i in test_idx]
-                #test_similarities = [gene_similarities[i] for i in test_idx]
-                #test_labels = [gene_labels[i] for i in test_idx]
+                        #projection results
+                        results = {'knn': [], 'ridge': []}
+                        #knn eval:
+                        accuracy, precision, recall, f1, auc = knn_metrics(test_projections, test_quartiles, train_projections, train_quartiles)
+                        results['knn'] = [accuracy, precision, recall, f1, auc]
+                        #ridge eval:
+                        accuracy, precision, recall, f1, auc = ridge_metrics(train_projections, train_quartiles, test_projections, test_quartiles)
+                        results['ridge'] = [accuracy, precision, recall, f1, auc]
+                        gene_to_metrics['projections']['positional_split'][current_gene] = results
 
-                if len(set(train_quartiles)) < 2 or len(set(test_quartiles)) < 2:
-                    print(f"Skipping gene {current_gene} for random split due to only one quartile present in train or test set")
-                    should_evaluate=False
+                if not args.eval_regression:
+                    #RANDOM SPLIT 
+                    indices = list(range(len(gene_encodings)))
+                    np.random.shuffle(indices)
+                    train_idx = indices[:int(len(indices)*0.8)]
+                    test_idx = indices[int(len(indices)*0.8):]
 
-                if should_evaluate:
-                    #projection results
-                    results = {'knn': [], 'ridge': []}
-                    #knn eval:
-                    accuracy, precision, recall, f1, auc = knn_metrics(test_encodings, test_quartiles, train_encodings, train_quartiles)
-                    results['knn'] = [accuracy, precision, recall, f1, auc]
-                    #ridge eval:
-                    accuracy, precision, recall, f1, auc = ridge_metrics(train_encodings, train_quartiles, test_encodings, test_quartiles)
-                    results['ridge'] = [accuracy, precision, recall, f1, auc]
-                    gene_to_metrics['baseline']['random_split'][current_gene] = results
+                    #sample train set size if specified
+                    if train_size is not None and len(train_idx) > train_size:
+                        if train_size <= 1: #handle fraction
+                            train_num = int(len(train_idx) * train_size)
+                        else:
+                            train_num = train_size
+                        train_idx = np.random.choice(train_idx, size=train_num, replace=False).tolist()
 
-                    #projection results
-                    results = {'knn': [], 'ridge': []}
-                    #knn eval:
-                    accuracy, precision, recall, f1, auc = knn_metrics(test_projections, test_quartiles, train_projections, train_quartiles)
-                    results['knn'] = [accuracy, precision, recall, f1, auc]
-                    #ridge eval:
-                    accuracy, precision, recall, f1, auc = ridge_metrics(train_projections, train_quartiles, test_projections, test_quartiles)
-                    results['ridge'] = [accuracy, precision, recall, f1, auc]
-                    gene_to_metrics['projections']['random_split'][current_gene] = results
+                    if len(train_idx) == 0 or len(test_idx) == 0:
+                        print(f"Skipping gene {current_gene} for random split due to insufficient data after sampling")
+                        should_evaluate=False
+                    
+                    train_encodings = [gene_encodings[i] for i in train_idx]
+                    train_projections = [gene_projections[i] for i in train_idx]
+                    train_quartiles = [gene_quartiles[i] for i in train_idx]
+                    
+                    if len(train_encodings) < 5:
+                        print(f"Skipping gene {current_gene} for random split due to insufficient training data")
+                        should_evaluate=False
+                    #train_similarities = [gene_similarities[i] for i in train_idx]
+                    #train_labels = [gene_labels[i] for i in train_idx]
+                    
+                    test_encodings = [gene_encodings[i] for i in test_idx]
+                    test_projections = [gene_projections[i] for i in test_idx]
+                    test_quartiles = [gene_quartiles[i] for i in test_idx]
+                    #test_similarities = [gene_similarities[i] for i in test_idx]
+                    #test_labels = [gene_labels[i] for i in test_idx]
+
+                    if len(set(train_quartiles)) < 2 or len(set(test_quartiles)) < 2:
+                        print(f"Skipping gene {current_gene} for random split due to only one quartile present in train or test set")
+                        should_evaluate=False
+
+                    if should_evaluate:
+                        #projection results
+                        results = {'knn': [], 'ridge': []}
+                        #knn eval:
+                        accuracy, precision, recall, f1, auc = knn_metrics(test_encodings, test_quartiles, train_encodings, train_quartiles)
+                        results['knn'] = [accuracy, precision, recall, f1, auc]
+                        #ridge eval:
+                        accuracy, precision, recall, f1, auc = ridge_metrics(train_encodings, train_quartiles, test_encodings, test_quartiles)
+                        results['ridge'] = [accuracy, precision, recall, f1, auc]
+                        gene_to_metrics['baseline']['random_split'][current_gene] = results
+
+                        #projection results
+                        results = {'knn': [], 'ridge': []}
+                        #knn eval:
+                        accuracy, precision, recall, f1, auc = knn_metrics(test_projections, test_quartiles, train_projections, train_quartiles)
+                        results['knn'] = [accuracy, precision, recall, f1, auc]
+                        #ridge eval:
+                        accuracy, precision, recall, f1, auc = ridge_metrics(train_projections, train_quartiles, test_projections, test_quartiles)
+                        results['ridge'] = [accuracy, precision, recall, f1, auc]
+                        gene_to_metrics['projections']['random_split'][current_gene] = results
                 
             #reset for next gene
             current_gene = gene
             gene_encodings = []
             gene_projections = []
+            gene_scores = []
             #gene_similarities = []
             #gene_labels = []
             gene_quartiles = []
@@ -1108,13 +1145,20 @@ def ohe_llr_baseline(batches, projection_net, train_size=None):
         #print(f"Removing {len(nan_idx)} features with nan values")
         ohe_features = np.delete(ohe_features, nan_idx, axis=0)
         projections = np.delete(projections, nan_idx, axis=0)
-        quartiles = [quartiles[i] for i in range(len(quartiles)) if i not in nan_idx]
         mutants = [mutants[i] for i in range(len(mutants)) if i not in nan_idx]
-        assert len(ohe_features) == len(quartiles) == len(mutants) == len(projections)
+        if args.eval_regression:
+            dms_scores = [dms_scores[i] for i in range(len(dms_scores)) if i not in nan_idx]
+        else:
+            quartiles = [quartiles[i] for i in range(len(quartiles)) if i not in nan_idx]
+
+        assert len(ohe_features) == len(mutants) == len(projections)
         gene_encodings.extend(ohe_features)
         gene_projections.extend(projections)
-        gene_quartiles.extend(quartiles)
         gene_mutants.extend(mutants)
+        if args.eval_regression:
+            gene_scores.extend(dms_scores)
+        else:
+            gene_quartiles.extend(quartiles)
 
         #loss, similarities, distances, labels = loss_fn(torch.tensor(ohe_features, dtype=torch.float32), quartiles)
 
@@ -1127,6 +1171,8 @@ def ohe_llr_baseline(batches, projection_net, train_size=None):
 
 
     #save to json
+    if train_size is None:
+        train_size=1.0
     dict_dir = f'{RESULTS_DIR}/result_dicts'
     os.makedirs(dict_dir, exist_ok=True)
     with open(f'{dict_dir}/ohe_llr_metrics_{train_size:g}.json', 'w') as f:
@@ -1139,19 +1185,52 @@ def ohe_llr_baseline(batches, projection_net, train_size=None):
     
     
     #average metrics across all genes
-    with open(RESULTS_FILE, 'a') as f:
-        for split_type in ['random_split', 'positional_split']:
+    if args.eval_regression:
+        with open(RESULTS_FILE, 'a') as f:
             for model in ['baseline', 'projections']:
-                for classifier in ['knn', 'ridge']:
-                    acc = np.mean([gene_to_metrics[model][split_type][gene][classifier][0] for gene in gene_to_metrics[model][split_type]])
-                    precision = np.mean([gene_to_metrics[model][split_type][gene][classifier][1] for gene in gene_to_metrics[model][split_type]])
-                    recall = np.mean([gene_to_metrics[model][split_type][gene][classifier][2] for gene in gene_to_metrics[model][split_type]])
-                    f1 = np.mean([gene_to_metrics[model][split_type][gene][classifier][3] for gene in gene_to_metrics[model][split_type]])
-                    auc = np.mean([gene_to_metrics[model][split_type][gene][classifier][4] for gene in gene_to_metrics[model][split_type]])
-                    
-                    f.write(f'{RUN_NAME}_{model}_{classifier}_{split_type}_{train_size:g},-,{acc},{precision},{recall},{f1},{auc}\n')
+                mse = np.mean([gene_to_metrics[model]['positional_split'][gene]['ridge'] for gene in gene_to_metrics[model]['positional_split']])
+                print(f'Average MSE: {mse}')
+                f.write(f'{RUN_NAME}_{model}_positionalsplit_ridgeregression_MSE_{train_size:g},{mse},-,-,-,-,-\n')
+    else:
+        with open(RESULTS_FILE, 'a') as f:
+            for split_type in ['random_split', 'positional_split']:
+                for model in ['baseline', 'projections']:
+                    for classifier in ['knn', 'ridge']:
+                        acc = np.mean([gene_to_metrics[model][split_type][gene][classifier][0] for gene in gene_to_metrics[model][split_type]])
+                        precision = np.mean([gene_to_metrics[model][split_type][gene][classifier][1] for gene in gene_to_metrics[model][split_type]])
+                        recall = np.mean([gene_to_metrics[model][split_type][gene][classifier][2] for gene in gene_to_metrics[model][split_type]])
+                        f1 = np.mean([gene_to_metrics[model][split_type][gene][classifier][3] for gene in gene_to_metrics[model][split_type]])
+                        auc = np.mean([gene_to_metrics[model][split_type][gene][classifier][4] for gene in gene_to_metrics[model][split_type]])
+                        
+                        f.write(f'{RUN_NAME}_{model}_{classifier}_{split_type}_{train_size:g},-,{acc},{precision},{recall},{f1},{auc}\n')
 
     return gene_to_metrics
+
+def precompute_batches(dataloader, projection_net):
+    dataloader.load_ohe = True
+    batches = []
+    with torch.no_grad():
+        for batch in tqdm(dataloader, desc="OHE LLR Baseline"):
+            batch_data = {'quartiles': [], 'ohe_features': [], 'projections': [], 'mutants': [], 'genes': [], 'dms_scores': []}
+            quartiles = batch['quartiles']
+            ohe_features = batch['ohe_features'].cpu()
+            projections = projection_net(batch).cpu().numpy()
+            mutants = batch['mutants']
+
+            assert len(set(batch['genes'])) == 1 #should only be used with gene-aware loader
+            gene = batch['genes'][0]
+
+            if args.eval_regression:
+                batch_data['dms_scores'] = (batch['dms_scores'])
+            else:
+                batch_data['quartiles'] = (quartiles)
+            batch_data['ohe_features'] = (ohe_features)
+            batch_data['projections'] = (projections)
+            batch_data['mutants'] = (mutants)
+            batch_data['genes'] = ([gene] * len(projections))
+            
+            batches.append(batch_data)
+    return batches
     
 
 def classification_comparison_by_train_size(projection_net, dataloader, device, num_bootstraps=10, train_sizes=[.05, .1, .2, .4, .6, .8]):
@@ -1166,23 +1245,7 @@ def classification_comparison_by_train_size(projection_net, dataloader, device, 
     os.makedirs(plot_dir, exist_ok=True)
 
     #precompute:
-    batches = []
-    for batch in tqdm(dataloader, desc="OHE LLR Baseline"):
-        batch_data = {'quartiles': [], 'ohe_features': [], 'projections': [], 'mutants': [], 'genes': []}
-        quartiles = batch['quartiles']
-        ohe_features = batch['ohe_features']
-        projections = projection_net(batch).cpu().detach().numpy()
-        mutants = batch['mutants']
-
-        assert len(set(batch['genes'])) == 1 #should only be used with gene-aware loader
-        gene = batch['genes'][0]
-
-        batch_data['quartiles'] = (quartiles)
-        batch_data['ohe_features'] = (ohe_features)
-        batch_data['projections'] = (projections)
-        batch_data['mutants'] = (mutants)
-        batch_data['genes'] = ([gene] * len(projections))
-        batches.append(batch_data)
+    batches = precompute_batches(dataloader, projection_net)
 
     #get acc and auc for llr score alone:
     llr_auc, llr_acc = llr_threshold_performance(dataloader)
@@ -1595,7 +1658,7 @@ def main():
         print("Not in Colab environment, skipping drive mount")"""
 
     #load and preprocess data
-    df = load_and_preprocess_data(DATA_PATH)
+    df, original_length = load_and_preprocess_data(DATA_PATH)
     print(f'Initial mutated sequence length distribution: {df["mutated_sequence"].str.len().describe()}')
     initial_length = len(df)
     df = df[df['mutated_sequence'].str.len() <= args.esm_max_length]
@@ -1636,12 +1699,12 @@ def main():
     #init h5 file for embeddings
     if args.embeddings_path is not None:
         global ESMEmbeddingLoader
-        ESMEmbeddingLoader = h5_utils.EmbeddingLoader(args.embeddings_path, len(train_seqs)+len(test_seqs)+filtered_count, embed_dim=args.input_dim)
+        ESMEmbeddingLoader = h5_utils.EmbeddingLoader(args.embeddings_path, original_length*1.05, embed_dim=args.input_dim)
     else:
         raise ValueError("Embeddings path must be specified")
     if args.ohe_baseline:
         global OHEEmbeddingLoader
-        OHEEmbeddingLoader = h5_utils.EmbeddingLoader(args.ohe_embeddings_path, len(train_seqs)+len(test_seqs)+filtered_count, embed_dim=20*args.esm_max_length)
+        OHEEmbeddingLoader = h5_utils.EmbeddingLoader(args.ohe_embeddings_path, original_length*1.05, embed_dim=20*args.esm_max_length)
 
     #create datasets
     if args.split_by_gene:
@@ -1712,10 +1775,12 @@ def main():
         print(f"\n Loading model from {args.model_path}")
         checkpoint = torch.load(args.model_path, map_location=device)
         projection_net.load_state_dict(checkpoint['model_state_dict'])
-        if checkpoint.get('esm_model_state_dict') is not None:
+        if checkpoint.get('esm_model_state_dict') is not None and args.use_lora:
             print(" Loading ESM LoRA adapter state")
             esm_model.load_state_dict(checkpoint['esm_model_state_dict']) #load whole model state dict, but only the adapter weights will be updated since the rest of the model is frozen
             esm_model.eval()
+        else:
+            print('NOT LOADING ESM LORA ADAPTER')
         projection_net.eval()
         print(" Model loaded successfully")
     elif args.num_epochs != 0:
@@ -1803,15 +1868,19 @@ def main():
             gene_aware_test_loader = DataLoader(test_dataset, batch_size=BATCH_SIZE, gene_to_wt = gene_to_wt, shuffle=False, gene_aware=True)
         else:
             gene_aware_test_loader = test_loader
-        classification_comparison_by_train_size(projection_net, gene_aware_test_loader, device, train_sizes=[.01, .025, .05, .1, .2, .4, .6, .8, 1.0])
+        if args.eval_regression:
+            batches = precompute_batches(gene_aware_test_loader, projection_net)
+            ohe_llr_baseline(batches, projection_net)
+        else:
+            classification_comparison_by_train_size(projection_net, gene_aware_test_loader, device, train_sizes=[.01, .025, .05, .1, .2, .4, .6, .8, 1.0])
         
 
 
-    print(f"\nDistance Statistics:")
-    print(f"  Mean: {np.mean(test_dists):.4f}")
-    print(f"  Std: {np.std(test_dists):.4f}")
-    print(f"  Min: {np.min(test_dists):.4f}")
-    print(f"  Max: {np.max(test_dists):.4f}")
+    #print(f"\nDistance Statistics:")
+    #print(f"  Mean: {np.mean(test_dists):.4f}")
+    #print(f"  Std: {np.std(test_dists):.4f}")
+    #print(f"  Min: {np.min(test_dists):.4f}")
+    #print(f"  Max: {np.max(test_dists):.4f}")
 
     #print("\n=== Final Distance Clustering ===")
     #plot_distance_clustering(test_dists, test_labels, "Final Test Set", final=True)

@@ -38,6 +38,11 @@ class EmbeddingLoader:
         else:
             self.h5_file = h5py.File(embeddings_path, "r+")
 
+        print(f'H5 stats for {embeddings_path}')
+        print("shape:", h5_file['X'].shape)
+        print("maxshape:", h5_file['X'].maxshape)
+        print("chunks:", h5_file['X'].chunks)
+
         if not os.path.exists(self.hash_to_id_path):
             with open(self.hash_to_id_path, 'w') as hash_file:
                 json.dump({}, hash_file) 

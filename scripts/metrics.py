@@ -3,8 +3,8 @@ from sklearn.cluster import KMeans
 from sklearn.linear_model import LogisticRegression
 import numpy as np
 from sklearn.neighbors import KNeighborsClassifier
-from sklearn.linear_model import RidgeClassifier
-from sklearn.metrics import roc_auc_score
+from sklearn.linear_model import RidgeClassifier, Ridge
+from sklearn.metrics import roc_auc_score, mean_squared_error
 
 
 def ridge_metrics(train_projections, train_quartiles, test_projections, test_quartiles):
@@ -25,6 +25,18 @@ def ridge_metrics(train_projections, train_quartiles, test_projections, test_qua
     auc = roc_auc_score(test_quartiles, probs)
     
     return accuracy, precision, recall, f1, auc
+
+def ridge_regression_metrics(train_projections, train_scores, test_projections, test_scores):
+    ridge = Ridge()
+    ridge.fit(train_projections, train_scores)
+
+    preds = ridge.predict(test_projections)
+
+    mse = mean_squared_error(test_scores, preds)
+    
+    return mse
+
+
 
 def knn_metrics(test_embeddings, test_quartiles, train_embeddings, train_quartiles):
     if len(train_embeddings) < 5:
