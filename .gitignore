@@ -11,3 +11,4 @@ results/*
 venv/*
 .env
 wandb/
+pipeline_esmc.py

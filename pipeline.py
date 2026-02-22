@@ -101,6 +101,7 @@ def parse_args():
                         help='Target modules for LoRA')
     parser.add_argument('--esm_lr', type=float, default=0.00005, 
                         help='Learning rate for ESM LoRA adapter')
+    parser.add_argument('--esm_warmup', type=float, default=0.05)
 
     #wandb args
     parser.add_argument('--wandb_project', type=str, default='dms-contrastive', help='Weights and Biases project name')
@@ -1364,6 +1365,7 @@ def train(projection_net, loss_fn, train_loader, test_loader, optimizer, device)
     """
 
     #Weights and Biases tracking:
+    from transformers import get_cosine_schedule_with_warmup
     run = wandb.init(project=args.wandb_project, name=RUN_NAME, entity=args.wandb_entity, config=args.__dict__)
     
     train_losses = []
@@ -1406,6 +1408,18 @@ def train(projection_net, loss_fn, train_loader, test_loader, optimizer, device)
     print(f'Evaluations per epoch: {evals_per_epoch}')
     if args.patience < (evals_per_epoch):
         print(f'**WARNING: patience ({args.patience}) is less than the number of evaluations per epoch ({evals_per_epoch}), which may lead to early stopping before one full epoch is completed.')
+
+    total_training_steps = NUM_EPOCHS * effective_batches
+    warmup_steps = int(args.esm_warmup * total_training_steps)  # 5% warmup
+    print(f'Warmup steps: {warmup_steps}')
+
+    if esm_optimizer is not None:
+        esm_scheduler = get_cosine_schedule_with_warmup(
+            esm_optimizer,
+            num_warmup_steps=warmup_steps,
+            num_training_steps=total_training_steps
+        )
+
 
     for epoch in range(NUM_EPOCHS):
         print(f"\nEpoch {epoch+1}/{NUM_EPOCHS}")
@@ -1456,6 +1470,7 @@ def train(projection_net, loss_fn, train_loader, test_loader, optimizer, device)
                 optimizer.step()
                 if esm_optimizer is not None:
                     esm_optimizer.step()
+                    esm_scheduler.step()
                 
                 global_step += 1
 
