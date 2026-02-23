@@ -32,7 +32,7 @@ import scripts.h5_utils as h5_utils
 import json
 import re
 from contextlib import redirect_stdout, redirect_stderr
-from scripts.metrics import contrastive_metrics, kmeans_metrics, logreg_metrics, knn_metrics, ridge_metrics
+from scripts.metrics import contrastive_metrics, kmeans_metrics, logreg_metrics, knn_metrics, ridge_metrics, ridge_regression_metrics
 
 warnings.filterwarnings('ignore')
 
@@ -1039,12 +1039,12 @@ def ohe_llr_baseline(batches, projection_net, train_size=None):
                 if should_evaluate:
                     if args.eval_regression:
                         #ridge baseline:
-                        mse = ridge_metrics(train_encodings, train_scores, test_encodings, test_scores)
-                        gene_to_metrics['baseline']['positional_split'][current_gene]['ridge'] = mse
+                        mse = ridge_regression_metrics(train_encodings, train_scores, test_encodings, test_scores)
+                        gene_to_metrics['baseline']['positional_split'][current_gene] = {'ridge': mse}
 
                         #ridge projections:
-                        mse = ridge_metrics(train_projections, train_scores, test_projections, test_scores)
-                        gene_to_metrics['projections']['positional_split'][current_gene]['ridge'] = mse
+                        mse = ridge_regression_metrics(train_projections, train_scores, test_projections, test_scores)
+                        gene_to_metrics['projections']['positional_split'][current_gene] = {'ridge': mse}
 
 
                     else:
@@ -1139,6 +1139,8 @@ def ohe_llr_baseline(batches, projection_net, train_size=None):
         #print(ohe_features)
         #print(ohe_features.shape)
         #print(type(ohe_features))
+
+        #print(gene_to_metrics)
 
         #remove nans and stay consistent with quartiles
         nan_idx = np.where(np.isnan(ohe_features).any(axis=1))[0]

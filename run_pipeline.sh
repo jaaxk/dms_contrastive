@@ -13,15 +13,15 @@ BASE_DATA_PATH="/gpfs/scratch/jv2807/dms_data"
 
 EMBEDDING_LAYER="layer33_mean"
 
-for COARSE_SELECTION_TYPE in "Stability" "Expression" "Activity" "Binding" "OrganismalFitness" ; do
+for COARSE_SELECTION_TYPE in "Activity" ; do
     echo "Running ${COARSE_SELECTION_TYPE} ${EMBEDDING_LAYER}"
 
-    RUN_NAME="650M_NWT_nolora_evalregression_${COARSE_SELECTION_TYPE}"
+    RUN_NAME="650M_NWT_lora_eval_dontuse_${COARSE_SELECTION_TYPE}"
 
     python -u pipeline.py --run_name $RUN_NAME \
         --data_path $BASE_DATA_PATH/datasets/${COARSE_SELECTION_TYPE}.csv \
-        --embeddings_path $BASE_DATA_PATH/embeddings/${COARSE_SELECTION_TYPE}/650M_t33_mean_layer33_2.h5 \
-        --ohe_embeddings_path $BASE_DATA_PATH/embeddings/${COARSE_SELECTION_TYPE}/ohe_embeddings18508745    .h5 \
+        --embeddings_path $BASE_DATA_PATH/embeddings/${COARSE_SELECTION_TYPE}/650M_t33_mean_layer33.h5 \
+        --ohe_embeddings_path $BASE_DATA_PATH/embeddings/${COARSE_SELECTION_TYPE}/ohe_embeddings.h5 \
         --model_cache /gpfs/scratch/jv2807/cache \
         --model_name facebook/esm2_t33_650M_UR50D \
         --esm_max_length 600 \
@@ -41,10 +41,8 @@ for COARSE_SELECTION_TYPE in "Stability" "Expression" "Activity" "Binding" "Orga
         --lora_target_modules query key value \
         --split_by_gene \
         --split_file /gpfs/home/jv2807/dms_contrastive/results/650M_splitbygene_lora2_${COARSE_SELECTION_TYPE}_layer33_mean/data_split.json \
-        --model_path /gpfs/home/jv2807/dms_contrastive/results/650M_splitbygene_nolora_NWT1_train_same_gene_batch_test_same_gene_batch_${COARSE_SELECTION_TYPE}/model.pt \
-        --ohe_baseline \
-        --eval_regression
-    
+        --model_path /gpfs/home/jv2807/dms_contrastive/results/650M_splitbygene_NWT_lora_Activity_layer33_mean/model.pt \
+        --ohe_baseline    
 done
 
 #        --use_lora \

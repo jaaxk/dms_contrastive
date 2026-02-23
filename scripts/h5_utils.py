@@ -3,7 +3,8 @@ import numpy as np
 import hashlib
 import os
 import json
-import torch
+import atexit
+import signal
 
 
 class EmbeddingLoader:
@@ -18,6 +19,9 @@ class EmbeddingLoader:
         self.embeddings_path = embeddings_path
         self.N = N
         self.embed_dim = embed_dim
+
+        self._closed = False
+        self._register_cleanup_handlers()
 
         if not os.path.exists(embeddings_path):
             os.makedirs(os.path.dirname(embeddings_path), exist_ok=True)
@@ -39,15 +43,17 @@ class EmbeddingLoader:
             self.h5_file = h5py.File(embeddings_path, "r+")
 
         print(f'H5 stats for {embeddings_path}')
-        print("shape:", h5_file['X'].shape)
-        print("maxshape:", h5_file['X'].maxshape)
-        print("chunks:", h5_file['X'].chunks)
+        print("shape:", self.h5_file['X'].shape)
+        print("maxshape:", self.h5_file['X'].maxshape)
+        print("chunks:", self.h5_file['X'].chunks)
 
         if not os.path.exists(self.hash_to_id_path):
             with open(self.hash_to_id_path, 'w') as hash_file:
                 json.dump({}, hash_file) 
         with open(self.hash_to_id_path, 'r') as hash_file:
             self.hash_to_id = json.load(hash_file)
+
+        self.current_size = self.h5_file["X"].shape[0]
 
 
     def seq_hash(self, seq):
@@ -62,19 +68,35 @@ class EmbeddingLoader:
         embeddings = []
         missing_seqs = []
         missing_indices = []
+        self.current_size = self.h5_file["X"].shape[0]
 
         for i, (seq, h) in enumerate(zip(sequences, hashes)):
             if h in self.hash_to_id:
                 val = self.hash_to_id[h]
+                idx = val[0] if isinstance(val, list) else val
+
+                if idx >= self.current_size:
+                    print(f"WARNING: Index {idx} out of bounds (size={self.current_size}), treating as missing")
+                    embeddings.append(None)
+                    missing_indices.append(i)
+                    missing_seqs.append(seq)
+                    continue
+
                 #handle both formats: int (no padding) and [idx, original_dim] (padded)
-                if isinstance(val, list):
-                    idx, original_dim = val
+                try:
                     emb = self.h5_file["X"][idx]
+                except OSError as e:
+                    print(f"WARNING: Corrupted data at index {idx}, removing from index: {e}")
+                    self.hash_to_id.pop(h)
+                    embeddings.append(None)
+                    missing_indices.append(i)
+                    missing_seqs.append(seq)
+                    continue
+                if isinstance(val, list):
+                    original_dim = val[1]
                     #un-pad back to original dimension
                     emb = emb[:original_dim]
-                else:
-                    idx = val
-                    emb = self.h5_file["X"][idx]
+             
                 embeddings.append(emb)
             else:
                 embeddings.append(None)
@@ -97,8 +119,8 @@ class EmbeddingLoader:
         original_dim = embeddings_np.shape[1]
         
         # Resize datasets if needed
-        current_size = self.h5_file["X"].shape[0]
-        if end_idx > current_size:
+        self.current_size = self.h5_file["X"].shape[0]
+        if end_idx > self.current_size:
             self.h5_file["X"].resize(end_idx, axis=0)
             self.h5_file["seq_ids"].resize(end_idx, axis=0)
         
@@ -121,11 +143,47 @@ class EmbeddingLoader:
 
         self.h5_file["X"][start_idx:end_idx] = embeddings_np.astype(np.float32)
         self.h5_file["seq_ids"][start_idx:end_idx] = hashes
+
+        self.h5_file.flush()
         
         tmp = self.hash_to_id_path + '.tmp'
         with open(tmp, 'w') as tmp_file:
             json.dump(self.hash_to_id, tmp_file)
         os.replace(tmp, self.hash_to_id_path)
 
+    def _register_cleanup_handlers(self):
+        atexit.register(self._safe_close)
+        
+        # Store original handlers to restore later
+        self._original_sigint = signal.getsignal(signal.SIGINT)
+        self._original_sigterm = signal.getsignal(signal.SIGTERM)
+        
+        signal.signal(signal.SIGINT, self._signal_handler)
+        signal.signal(signal.SIGTERM, self._signal_handler)
+    
+    def _signal_handler(self, signum, frame):
+        print(f"\nReceived signal {signum}, closing H5 file safely...")
+        self._safe_close()
+        
+        # Restore original handler and re-raise
+        if signum == signal.SIGINT:
+            signal.signal(signum, self._original_sigint)
+        else:
+            signal.signal(signum, self._original_sigterm)
+        os.kill(os.getpid(), signum)
+    
+    def _safe_close(self):
+        if not self._closed and self.h5_file is not None:
+            try:
+                self.h5_file.flush()
+                self.h5_file.close()
+                print("H5 file closed safely")
+            except Exception as e:
+                print(f"Warning closing H5: {e}")
+            finally:
+                self._closed = True
+                self.h5_file = None
+    
     def close_h5(self):
-        self.h5_file.close()
+        self._safe_close()
+
