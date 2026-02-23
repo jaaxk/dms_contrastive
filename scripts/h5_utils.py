@@ -160,6 +160,8 @@ class EmbeddingLoader:
         
         signal.signal(signal.SIGINT, self._signal_handler)
         signal.signal(signal.SIGTERM, self._signal_handler)
+
+        signal.signal(signal.SIGUSR1, self._signal_handler)
     
     def _signal_handler(self, signum, frame):
         print(f"\nReceived signal {signum}, closing H5 file safely...")

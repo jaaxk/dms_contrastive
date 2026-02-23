@@ -5,6 +5,7 @@
 #SBATCH --mem=200G
 #SBATCH --output=logs/%j_lora.out
 #SBATCH --job-name=dms_cl_sp
+#SBATCH --signal=B:TERM@60
 
 module load python/gpu/3.10.6-cuda12.9
 source venv/bin/activate
@@ -16,7 +17,7 @@ EMBEDDING_LAYER="layer33_mean"
 for COARSE_SELECTION_TYPE in "Activity" ; do
     echo "Running ${COARSE_SELECTION_TYPE} ${EMBEDDING_LAYER}"
 
-    RUN_NAME="650M_NWT_lora_eval_dontuse_${COARSE_SELECTION_TYPE}"
+    RUN_NAME="650M_NWT_lora_eval_${COARSE_SELECTION_TYPE}"
 
     python -u pipeline.py --run_name $RUN_NAME \
         --data_path $BASE_DATA_PATH/datasets/${COARSE_SELECTION_TYPE}.csv \
@@ -26,7 +27,7 @@ for COARSE_SELECTION_TYPE in "Activity" ; do
         --model_name facebook/esm2_t33_650M_UR50D \
         --esm_max_length 600 \
         --input_dim 1280 \
-        --batch_size 64 \
+        --batch_size 4 \
         --gradient_accumulation_steps 8 \
         --patience 4 \
         --eval_per_epoch 2 \
@@ -36,6 +37,7 @@ for COARSE_SELECTION_TYPE in "Activity" ; do
         --train_same_gene_batch \
         --test_same_gene_batch \
         --normalize_to_wt \
+        --use_lora \
         --lora_alpha 32 \
         --esm_lr .000005 \
         --lora_target_modules query key value \
