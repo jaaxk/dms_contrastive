@@ -27,7 +27,7 @@ from tqdm import tqdm
 import pickle
 import os
 import argparse
-from transformers import AutoTokenizer, AutoModel
+from transformers import AutoTokenizer, AutoModel, AutoModelForMaskedLM
 import scripts.h5_utils as h5_utils
 import json
 import re
@@ -158,8 +158,16 @@ if args.normalize_to_wt:
     
 #init ESM model
 #if args.model_path is None or args.use_lora:
-esm_model = AutoModel.from_pretrained(args.model_name)
-tokenizer = AutoTokenizer.from_pretrained(args.model_name)
+if 'esm2' in args.model_name:
+    print('Loading ESM2')
+    esm_model = AutoModel.from_pretrained(args.model_name)
+    tokenizer = AutoTokenizer.from_pretrained(args.model_name)
+elif 'esmc' in args.model_name:
+    print('Loading ESM-C')
+    esm_model = AutoModelForMaskedLM.from_pretrained('Synthyra/ESMplusplus_large', trust_remote_code=True)
+    tokenizer = esm_model.tokenizer
+else:
+    raise ValueError(f'{args.model_name} not supported')
 
 if args.use_lora:
     from scripts.lora_utils import setup_lora_esm, save_lora_adapter, load_lora_adapter
@@ -1796,7 +1804,7 @@ def main():
 
     
 
-        print("\n=== FINAL EVALUATION ===")
+        """print("\n=== FINAL EVALUATION ===")
 
         #different-gene batch evaluation
         print('main batch evaluation')
@@ -1860,6 +1868,7 @@ def main():
             f.write(f'{RUN_NAME}_knn,-,{knn_acc},{knn_precision},{knn_recall},{knn_f1},{knn_auc}\n')
             f.write(f'{RUN_NAME}_ridge,-,{ridge_acc},{ridge_precision},{ridge_recall},{ridge_f1},{ridge_auc}\n')
             f.write(f'{RUN_NAME}_contrastive,-,{val_acc},{val_precision},{val_recall},{val_f1},{val_auc}\n')
+        """
 
     if args.ohe_baseline:
         print("\n=== BASELINE vs PROJECTION EVALUATION ===")
