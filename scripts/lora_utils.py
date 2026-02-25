@@ -20,8 +20,8 @@ def setup_lora_esm(esm_model, lora_rank=8, lora_alpha=16, target_modules=None):
     # Debug: Print all module names to find attention layers
     #print("\n=== Model Architecture ===")
     #for name, module in esm_model.named_modules():
-    #    if 'attention' in name.lower() or 'query' in name.lower() or 'key' in name.lower() or 'value' in name.lower():
-    #        print(f"{name}: {type(module).__name__}")
+    #    if isinstance(module, torch.nn.Linear):
+    #        print(f"{name}: {module.weight.shape}")
 
     if target_modules is None:
         target_modules = ['query', 'value']  # Query and Value projections

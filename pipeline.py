@@ -181,7 +181,6 @@ esm_model.to(device)
 #    esm_model = None
 #    tokenizer = None
 
-
 if args.ohe_baseline:
     repo_path = os.path.abspath(args.esm_variants_module_path)
     if not os.path.exists(repo_path):
@@ -294,6 +293,7 @@ def load_embeddings_h5(sequences, embedding_loader, embedding_type, mutants=None
         if embedding_type == 'esm':
             if args.use_lora:
                 print('WARNING: while finetuning, we should not be generating new embeddings from this function: this probably means we are missing pre-computed WT embeddings and they are being generated here with the current (finetuned) model, not the original ESM model')
+                raise ValueError
             missing_embeddings = esm_batch(missing_seqs)
         elif embedding_type == 'ohe':
             #print('generating ohe embeddings')
@@ -1588,8 +1588,28 @@ def train(projection_net, loss_fn, train_loader, test_loader, optimizer, device)
                             best_esm_optimizer_state = esm_optimizer.state_dict().copy()
                         best_optimizer_state = optimizer.state_dict().copy()
                         print(f" Step {global_step+1}: New best val auc: {best_val_auc:.4f}")
+
+                        torch.save({
+                            'model_state_dict': best_model_state,
+                            'optimizer_state_dict': best_optimizer_state,
+                            'esm_model_state_dict': best_esm_state if args.use_lora else None,
+                            'train_losses': train_losses,
+                            'val_losses': val_losses,
+                            'global_step': global_step,
+                            'epoch': epoch,
+                            'config': {
+                                'distance_metric': DISTANCE_METRIC,
+                                'hidden_dims': HIDDEN_DIMS,
+                                'learning_rate': LEARNING_RATE,
+                                'best_val_auc': best_val_auc,
+                                'use_lora': args.use_lora,  # NEW
+                            }
+                        }, f'{RESULTS_DIR}/temp_model.pt')
+
                     else:
                         patience_counter += 1
+
+                    
 
         #if (epoch + 1) % 5 == 0:
         print(f"Epoch {epoch+1}/{NUM_EPOCHS}")
@@ -1883,7 +1903,7 @@ def main():
             batches = precompute_batches(gene_aware_test_loader, projection_net)
             ohe_llr_baseline(batches, projection_net)
         else:
-            classification_comparison_by_train_size(projection_net, gene_aware_test_loader, device, train_sizes=[.01, .025, .05, .1, .2, .4, .6, .8, 1.0])
+            classification_comparison_by_train_size(projection_net, gene_aware_test_loader, device, train_sizes=[.025, .05, 1.0])
         
 
 

@@ -12,14 +12,14 @@ source venv/bin/activate
 BASE_DATA_PATH="/gpfs/scratch/jv2807/dms_data"
 EMBEDDING_LAYER="layer33_mean"
 
-SELECTION_TYPES=("Binding" "Activity" "Expression")
+SELECTION_TYPES=("Activity" "OrganismalFitness" "Binding")
 
 # Manually assign each task to a specific GPU
 for i in "${!SELECTION_TYPES[@]}"; do
     COARSE_SELECTION_TYPE="${SELECTION_TYPES[$i]}"
     echo "Launching ${COARSE_SELECTION_TYPE} on GPU ${i}"
     
-    RUN_NAME="600M_esmc_NWT_${COARSE_SELECTION_TYPE}_${EMBEDDING_LAYER}"
+    RUN_NAME="600M_esmc_lora_NWT_${COARSE_SELECTION_TYPE}_${EMBEDDING_LAYER}"
     
     CUDA_VISIBLE_DEVICES=$i python -u pipeline.py --run_name $RUN_NAME \
         --data_path $BASE_DATA_PATH/datasets/${COARSE_SELECTION_TYPE}.csv \
@@ -39,9 +39,10 @@ for i in "${!SELECTION_TYPES[@]}"; do
         --train_same_gene_batch \
         --test_same_gene_batch \
         --normalize_to_wt \
+        --use_lora \
         --lora_alpha 32 \
         --esm_lr .000005 \
-        --lora_target_modules query key value \
+        --lora_target_modules layernorm_qkv.1 out_proj \
         --split_by_gene \
         --split_file /gpfs/home/jv2807/dms_contrastive/results/650M_splitbygene_lora2_${COARSE_SELECTION_TYPE}_layer33_mean/data_split.json \
         --ohe_baseline \
@@ -49,6 +50,9 @@ for i in "${!SELECTION_TYPES[@]}"; do
 done
 
 wait
+
+#for esm-c  --lora_target_modules layernorm_qkv.1 out_proj \
+#for esm2 key, value, target
 
 
 
