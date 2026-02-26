@@ -979,6 +979,146 @@ def ohe_llr_baseline(batches, projection_net, train_size=None):
 
     gene_to_metrics = {'baseline': {'random_split': {}, 'positional_split': {}}, 'projections': {'random_split': {}, 'positional_split': {}}}
     current_gene = None
+
+    def evaluate_gene(current_gene, gene_encodings, gene_projections, gene_scores, gene_quartiles, gene_mutants):
+        should_evaluate=True
+        #train/test split
+        #POSITIONAL SPLIT
+        train_idx, test_idx = positional_split(gene_mutants)
+        
+
+        #sample train set size if specified
+        if train_size is not None and len(train_idx) > train_size:
+            if train_size <= 1: #handle fraction
+                train_num = int(len(train_idx) * train_size)
+            else:
+                train_num = train_size
+            train_idx = np.random.choice(train_idx, size=train_num, replace=False).tolist()
+
+        if len(train_idx) == 0 or len(test_idx) == 0:
+            print(f"Skipping gene {current_gene} for positional split due to insufficient data after sampling")
+            should_evaluate=False
+
+        train_encodings = [gene_encodings[i] for i in train_idx]
+        train_projections = [gene_projections[i] for i in train_idx]
+        if args.eval_regression:
+            train_scores = [gene_scores[i] for i in train_idx]
+        else:
+            train_quartiles = [gene_quartiles[i] for i in train_idx]
+        
+        if len(train_encodings) < 5:
+            print(f"Skipping gene {current_gene} for positional split due to insufficient training data")
+            should_evaluate=False
+            
+    
+        #train_similarities = [gene_similarities[i] for i in train_idx]
+        #train_labels = [gene_labels[i] for i in train_idx]
+        
+        test_encodings = [gene_encodings[i] for i in test_idx]
+        test_projections = [gene_projections[i] for i in test_idx]
+        if args.eval_regression:
+            test_scores = [gene_scores[i] for i in test_idx]
+        else:
+            test_quartiles = [gene_quartiles[i] for i in test_idx]
+        #test_similarities = [gene_similarities[i] for i in test_idx]
+        #test_labels = [gene_labels[i] for i in test_idx]
+
+        if not args.eval_regression:
+            if len(set(train_quartiles)) < 2 or len(set(test_quartiles)) < 2:
+                print(f"Skipping gene {current_gene} for positional split due to only one quartile present in train or test set")
+                should_evaluate=False
+
+        #baseline results
+        if should_evaluate:
+            if args.eval_regression:
+                #ridge baseline:
+                mse = ridge_regression_metrics(train_encodings, train_scores, test_encodings, test_scores)
+                gene_to_metrics['baseline']['positional_split'][current_gene] = {'ridge': mse}
+
+                #ridge projections:
+                mse = ridge_regression_metrics(train_projections, train_scores, test_projections, test_scores)
+                gene_to_metrics['projections']['positional_split'][current_gene] = {'ridge': mse}
+
+
+            else:
+                results = {'knn': [], 'ridge': []}
+                #knn eval:
+                accuracy, precision, recall, f1, auc = knn_metrics(test_encodings, test_quartiles, train_encodings, train_quartiles)
+                results['knn'] = [accuracy, precision, recall, f1, auc]
+                #ridge eval:
+                accuracy, precision, recall, f1, auc = ridge_metrics(train_encodings, train_quartiles, test_encodings, test_quartiles)
+                results['ridge'] = [accuracy, precision, recall, f1, auc]
+                gene_to_metrics['baseline']['positional_split'][current_gene] = results
+
+                #projection results
+                results = {'knn': [], 'ridge': []}
+                #knn eval:
+                accuracy, precision, recall, f1, auc = knn_metrics(test_projections, test_quartiles, train_projections, train_quartiles)
+                results['knn'] = [accuracy, precision, recall, f1, auc]
+                #ridge eval:
+                accuracy, precision, recall, f1, auc = ridge_metrics(train_projections, train_quartiles, test_projections, test_quartiles)
+                results['ridge'] = [accuracy, precision, recall, f1, auc]
+                gene_to_metrics['projections']['positional_split'][current_gene] = results
+
+        if not args.eval_regression:
+            #RANDOM SPLIT 
+            indices = list(range(len(gene_encodings)))
+            np.random.shuffle(indices)
+            train_idx = indices[:int(len(indices)*0.8)]
+            test_idx = indices[int(len(indices)*0.8):]
+
+            #sample train set size if specified
+            if train_size is not None and len(train_idx) > train_size:
+                if train_size <= 1: #handle fraction
+                    train_num = int(len(train_idx) * train_size)
+                else:
+                    train_num = train_size
+                train_idx = np.random.choice(train_idx, size=train_num, replace=False).tolist()
+
+            if len(train_idx) == 0 or len(test_idx) == 0:
+                print(f"Skipping gene {current_gene} for random split due to insufficient data after sampling")
+                should_evaluate=False
+            
+            train_encodings = [gene_encodings[i] for i in train_idx]
+            train_projections = [gene_projections[i] for i in train_idx]
+            train_quartiles = [gene_quartiles[i] for i in train_idx]
+            
+            if len(train_encodings) < 5:
+                print(f"Skipping gene {current_gene} for random split due to insufficient training data")
+                should_evaluate=False
+            #train_similarities = [gene_similarities[i] for i in train_idx]
+            #train_labels = [gene_labels[i] for i in train_idx]
+            
+            test_encodings = [gene_encodings[i] for i in test_idx]
+            test_projections = [gene_projections[i] for i in test_idx]
+            test_quartiles = [gene_quartiles[i] for i in test_idx]
+            #test_similarities = [gene_similarities[i] for i in test_idx]
+            #test_labels = [gene_labels[i] for i in test_idx]
+
+            if len(set(train_quartiles)) < 2 or len(set(test_quartiles)) < 2:
+                print(f"Skipping gene {current_gene} for random split due to only one quartile present in train or test set")
+                should_evaluate=False
+
+            if should_evaluate:
+                #projection results
+                results = {'knn': [], 'ridge': []}
+                #knn eval:
+                accuracy, precision, recall, f1, auc = knn_metrics(test_encodings, test_quartiles, train_encodings, train_quartiles)
+                results['knn'] = [accuracy, precision, recall, f1, auc]
+                #ridge eval:
+                accuracy, precision, recall, f1, auc = ridge_metrics(train_encodings, train_quartiles, test_encodings, test_quartiles)
+                results['ridge'] = [accuracy, precision, recall, f1, auc]
+                gene_to_metrics['baseline']['random_split'][current_gene] = results
+
+                #projection results
+                results = {'knn': [], 'ridge': []}
+                #knn eval:
+                accuracy, precision, recall, f1, auc = knn_metrics(test_projections, test_quartiles, train_projections, train_quartiles)
+                results['knn'] = [accuracy, precision, recall, f1, auc]
+                #ridge eval:
+                accuracy, precision, recall, f1, auc = ridge_metrics(train_projections, train_quartiles, test_projections, test_quartiles)
+                results['ridge'] = [accuracy, precision, recall, f1, auc]
+                gene_to_metrics['projections']['random_split'][current_gene] = results
     
     for batch in tqdm(batches, desc="evaluating batches"):
         if args.eval_regression:
@@ -996,144 +1136,7 @@ def ohe_llr_baseline(batches, projection_net, train_size=None):
         if gene != current_gene:
             #evaluate last gene
             if current_gene is not None:
-                should_evaluate=True
-                #train/test split
-                #POSITIONAL SPLIT
-                train_idx, test_idx = positional_split(gene_mutants)
-                
-
-                #sample train set size if specified
-                if train_size is not None and len(train_idx) > train_size:
-                    if train_size <= 1: #handle fraction
-                        train_num = int(len(train_idx) * train_size)
-                    else:
-                        train_num = train_size
-                    train_idx = np.random.choice(train_idx, size=train_num, replace=False).tolist()
-
-                if len(train_idx) == 0 or len(test_idx) == 0:
-                    print(f"Skipping gene {current_gene} for positional split due to insufficient data after sampling")
-                    should_evaluate=False
-
-                train_encodings = [gene_encodings[i] for i in train_idx]
-                train_projections = [gene_projections[i] for i in train_idx]
-                if args.eval_regression:
-                    train_scores = [gene_scores[i] for i in train_idx]
-                else:
-                    train_quartiles = [gene_quartiles[i] for i in train_idx]
-                
-                if len(train_encodings) < 5:
-                    print(f"Skipping gene {current_gene} for positional split due to insufficient training data")
-                    should_evaluate=False
-                    
-            
-                #train_similarities = [gene_similarities[i] for i in train_idx]
-                #train_labels = [gene_labels[i] for i in train_idx]
-                
-                test_encodings = [gene_encodings[i] for i in test_idx]
-                test_projections = [gene_projections[i] for i in test_idx]
-                if args.eval_regression:
-                    test_scores = [gene_scores[i] for i in test_idx]
-                else:
-                    test_quartiles = [gene_quartiles[i] for i in test_idx]
-                #test_similarities = [gene_similarities[i] for i in test_idx]
-                #test_labels = [gene_labels[i] for i in test_idx]
-
-                if not args.eval_regression:
-                    if len(set(train_quartiles)) < 2 or len(set(test_quartiles)) < 2:
-                        print(f"Skipping gene {current_gene} for positional split due to only one quartile present in train or test set")
-                        should_evaluate=False
-
-                #baseline results
-                if should_evaluate:
-                    if args.eval_regression:
-                        #ridge baseline:
-                        mse = ridge_regression_metrics(train_encodings, train_scores, test_encodings, test_scores)
-                        gene_to_metrics['baseline']['positional_split'][current_gene] = {'ridge': mse}
-
-                        #ridge projections:
-                        mse = ridge_regression_metrics(train_projections, train_scores, test_projections, test_scores)
-                        gene_to_metrics['projections']['positional_split'][current_gene] = {'ridge': mse}
-
-
-                    else:
-                        results = {'knn': [], 'ridge': []}
-                        #knn eval:
-                        accuracy, precision, recall, f1, auc = knn_metrics(test_encodings, test_quartiles, train_encodings, train_quartiles)
-                        results['knn'] = [accuracy, precision, recall, f1, auc]
-                        #ridge eval:
-                        accuracy, precision, recall, f1, auc = ridge_metrics(train_encodings, train_quartiles, test_encodings, test_quartiles)
-                        results['ridge'] = [accuracy, precision, recall, f1, auc]
-                        gene_to_metrics['baseline']['positional_split'][current_gene] = results
-
-                        #projection results
-                        results = {'knn': [], 'ridge': []}
-                        #knn eval:
-                        accuracy, precision, recall, f1, auc = knn_metrics(test_projections, test_quartiles, train_projections, train_quartiles)
-                        results['knn'] = [accuracy, precision, recall, f1, auc]
-                        #ridge eval:
-                        accuracy, precision, recall, f1, auc = ridge_metrics(train_projections, train_quartiles, test_projections, test_quartiles)
-                        results['ridge'] = [accuracy, precision, recall, f1, auc]
-                        gene_to_metrics['projections']['positional_split'][current_gene] = results
-
-                if not args.eval_regression:
-                    #RANDOM SPLIT 
-                    indices = list(range(len(gene_encodings)))
-                    np.random.shuffle(indices)
-                    train_idx = indices[:int(len(indices)*0.8)]
-                    test_idx = indices[int(len(indices)*0.8):]
-
-                    #sample train set size if specified
-                    if train_size is not None and len(train_idx) > train_size:
-                        if train_size <= 1: #handle fraction
-                            train_num = int(len(train_idx) * train_size)
-                        else:
-                            train_num = train_size
-                        train_idx = np.random.choice(train_idx, size=train_num, replace=False).tolist()
-
-                    if len(train_idx) == 0 or len(test_idx) == 0:
-                        print(f"Skipping gene {current_gene} for random split due to insufficient data after sampling")
-                        should_evaluate=False
-                    
-                    train_encodings = [gene_encodings[i] for i in train_idx]
-                    train_projections = [gene_projections[i] for i in train_idx]
-                    train_quartiles = [gene_quartiles[i] for i in train_idx]
-                    
-                    if len(train_encodings) < 5:
-                        print(f"Skipping gene {current_gene} for random split due to insufficient training data")
-                        should_evaluate=False
-                    #train_similarities = [gene_similarities[i] for i in train_idx]
-                    #train_labels = [gene_labels[i] for i in train_idx]
-                    
-                    test_encodings = [gene_encodings[i] for i in test_idx]
-                    test_projections = [gene_projections[i] for i in test_idx]
-                    test_quartiles = [gene_quartiles[i] for i in test_idx]
-                    #test_similarities = [gene_similarities[i] for i in test_idx]
-                    #test_labels = [gene_labels[i] for i in test_idx]
-
-                    if len(set(train_quartiles)) < 2 or len(set(test_quartiles)) < 2:
-                        print(f"Skipping gene {current_gene} for random split due to only one quartile present in train or test set")
-                        should_evaluate=False
-
-                    if should_evaluate:
-                        #projection results
-                        results = {'knn': [], 'ridge': []}
-                        #knn eval:
-                        accuracy, precision, recall, f1, auc = knn_metrics(test_encodings, test_quartiles, train_encodings, train_quartiles)
-                        results['knn'] = [accuracy, precision, recall, f1, auc]
-                        #ridge eval:
-                        accuracy, precision, recall, f1, auc = ridge_metrics(train_encodings, train_quartiles, test_encodings, test_quartiles)
-                        results['ridge'] = [accuracy, precision, recall, f1, auc]
-                        gene_to_metrics['baseline']['random_split'][current_gene] = results
-
-                        #projection results
-                        results = {'knn': [], 'ridge': []}
-                        #knn eval:
-                        accuracy, precision, recall, f1, auc = knn_metrics(test_projections, test_quartiles, train_projections, train_quartiles)
-                        results['knn'] = [accuracy, precision, recall, f1, auc]
-                        #ridge eval:
-                        accuracy, precision, recall, f1, auc = ridge_metrics(train_projections, train_quartiles, test_projections, test_quartiles)
-                        results['ridge'] = [accuracy, precision, recall, f1, auc]
-                        gene_to_metrics['projections']['random_split'][current_gene] = results
+                evaluate_gene(current_gene, gene_encodings, gene_projections, gene_scores, gene_quartiles, gene_mutants)
                 
             #reset for next gene
             current_gene = gene
@@ -1179,6 +1182,9 @@ def ohe_llr_baseline(batches, projection_net, train_size=None):
         #all_distances.extend(distances)
         #all_labels.extend(labels)
 
+    #evaluate final gene (last gene is never handled by gene-change trigger inside the loop)
+    if current_gene is not None:
+        evaluate_gene(current_gene, gene_encodings, gene_projections, gene_scores, gene_quartiles, gene_mutants)
 
     #save to json
     if train_size is None:
