@@ -74,7 +74,7 @@ def parse_args():
     parser.add_argument('--same_gene_batch', action='store_true', help='each batch contains a single gene, no cross-gene pairs', default=False)
     parser.add_argument('--model_cache', default=None)
     parser.add_argument('--esm_max_length', type=int, default=75)
-    parser.add_argument('--input_dim', type=int, default=1280)
+    parser.add_argument('--input_dim', type=int, default=None)
     parser.add_argument('--dropout', type=float, default=0.1)
     parser.add_argument('--metadata_path', default=None)
     parser.add_argument('--normalize_to_wt', action='store_true', default=False)
@@ -160,12 +160,14 @@ if args.normalize_to_wt:
 #if args.model_path is None or args.use_lora:
 if 'esm2' in args.model_name:
     print('Loading ESM2')
-    esm_model = AutoModel.from_pretrained(args.model_name)
-    tokenizer = AutoTokenizer.from_pretrained(args.model_name)
+    esm_model = AutoModel.from_pretrained('facebook/esm2_t33_650M_UR50D')
+    tokenizer = AutoTokenizer.from_pretrained('facebook/esm2_t33_650M_UR50D')
+    args.input_dim=1280
 elif 'esmc' in args.model_name:
     print('Loading ESM-C')
     esm_model = AutoModelForMaskedLM.from_pretrained('Synthyra/ESMplusplus_large', trust_remote_code=True)
     tokenizer = esm_model.tokenizer
+    args.input_dim = 1152
 else:
     raise ValueError(f'{args.model_name} not supported')
 
