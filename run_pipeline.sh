@@ -2,8 +2,8 @@
 #SBATCH -p gpu4_medium
 #SBATCH --gres=gpu:1
 #SBATCH --time=72:00:00
-#SBATCH --mem=200G
-#SBATCH --output=logs/%j_lora.out
+#SBATCH --mem=30G
+#SBATCH --output=logs/%j.out
 #SBATCH --job-name=dms_cl_sp
 #SBATCH --signal=B:TERM@60
 
@@ -14,15 +14,15 @@ BASE_DATA_PATH="/gpfs/scratch/jv2807/dms_data"
 
 EMBEDDING_LAYER="layer33_mean"
 
-for COARSE_SELECTION_TYPE in "Stability" "OrganismalFitness" ; do
+for COARSE_SELECTION_TYPE in "Stability" "OrganismalFitness" "Activity" "Expression"  ; do
     echo "Running ${COARSE_SELECTION_TYPE} ${EMBEDDING_LAYER}"
 
-    RUN_NAME="600M_esmc_lora_NWT_${COARSE_SELECTION_TYPE}"
+    RUN_NAME="esmc_figures_${COARSE_SELECTION_TYPE}"
 
     python -u pipeline.py --run_name $RUN_NAME \
         --data_path $BASE_DATA_PATH/datasets/${COARSE_SELECTION_TYPE}.csv \
-        --embeddings_path $BASE_DATA_PATH/embeddings/${COARSE_SELECTION_TYPE}/600M_esmc_mean.h5 \
-        --ohe_embeddings_path $BASE_DATA_PATH/embeddings/${COARSE_SELECTION_TYPE}/ohe_embeddings.h5 \
+        --embeddings_path $BASE_DATA_PATH/embeddings/{selection_type}/600M_esmc_mean.h5 \
+        --ohe_embeddings_path $BASE_DATA_PATH/embeddings/{selection_type}/ohe_embeddings.h5 \
         --model_cache /gpfs/scratch/jv2807/cache \
         --model_name esmc \
         --esm_max_length 600 \
@@ -43,7 +43,8 @@ for COARSE_SELECTION_TYPE in "Stability" "OrganismalFitness" ; do
         --split_by_gene \
         --split_file /gpfs/home/jv2807/dms_contrastive/results/650M_splitbygene_lora2_${COARSE_SELECTION_TYPE}_layer33_mean/data_split.json \
         --ohe_baseline \
-        --model_path /gpfs/home/jv2807/dms_contrastive/results/600M_esmc_NWT_${COARSE_SELECTION_TYPE}/model.pt
+        --model_path /gpfs/home/jv2807/dms_contrastive/results/600M_esmc_NWT_${COARSE_SELECTION_TYPE}/model.pt \
+        --selection_types ${COARSE_SELECTION_TYPE}
 
 done
 

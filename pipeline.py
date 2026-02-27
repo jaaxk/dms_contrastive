@@ -626,12 +626,19 @@ def load_and_preprocess_data(data_path):
     df = pd.read_csv(data_path)
     original_length = len(df)
 
-    if 'coarse_selection_type' not in df.columns:
-        raise ValueError("Input data must contain 'coarse_selection_type' column when using --selection_types")
-    before_filter_len = len(df)
-    df = df[df['coarse_selection_type'].isin(args.selection_types)].copy()
-    if len(df) < before_filter_len:
-        print(f"WARNING: filtered dataset by --selection_types {args.selection_types}; removed {before_filter_len - len(df)} rows")
+    if 'coarse_selection_type' in df.columns:
+        before_filter_len = len(df)
+        df = df[df['coarse_selection_type'].isin(args.selection_types)].copy()
+        if len(df) < before_filter_len:
+            print(f"WARNING: filtered dataset by --selection_types {args.selection_types}; removed {before_filter_len - len(df)} rows")
+    elif isinstance(args.selection_types, list) and len(args.selection_types)>1:
+        raise ValueError('if specifyig multiple selection types, dataset needs coarse_selection_type column')
+    else:
+        if isinstance(args.selection_types, str):
+            coarse_selection_type = args.selection_types
+        elif isinstance(args.selection_types, list):
+            coarse_selection_type = args.selection_types[0]
+        df['coarse_selection_type'] = coarse_selection_type
 
     df = df.dropna(subset=['DMS_score', 'mutated_sequence', 'filename'])
 
@@ -1320,7 +1327,7 @@ def classification_comparison_by_train_size(projection_net, dataloader, device, 
     #plot results
     for split_type in ['random_split', 'positional_split']:
         metrics[split_type] = {}
-        for classifier in ['knn', 'ridge']:
+        for classifier in ['ridge']: #['knn', 'ridge']
             metrics[split_type][classifier] = {}
             for model in ['baseline', 'projections']:
                 metrics[split_type][classifier][model] = {'auc': {'avg': {}, 'std': {}, 'ci': {}},
@@ -1974,7 +1981,7 @@ def main():
             batches = precompute_batches(gene_aware_test_loader, projection_net)
             ohe_llr_baseline(batches, projection_net)
         else:
-            classification_comparison_by_train_size(projection_net, gene_aware_test_loader, device, train_sizes=[.025, .05, 1.0])
+            classification_comparison_by_train_size(projection_net, gene_aware_test_loader, device, train_sizes=[.025, .05, .1, .2, .4, .6, .8, 1.0], num_bootstraps=20)
         
 
 
