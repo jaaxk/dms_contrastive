@@ -1,5 +1,6 @@
 import pandas as pd
 
+"""
 selection_types = ['Stability', 'Binding', 'Expression', 'OrganismalFitness', 'Activity']
 data = {}
 for selection in selection_types:
@@ -20,3 +21,40 @@ for selection in selection_types:
 
 print()
 print(data)
+"""
+"""
+selection_types = ['Stability', 'Binding', 'Expression', 'OrganismalFitness', 'Activity']
+
+data_dir = "/gpfs/scratch/jv2807/dms_data/datasets"
+key_cols = ["filename", "uniprot_id", "dms_id"]
+
+records = []
+for selection in selection_types:
+    path = f"{data_dir}/{selection}.csv"
+    df = pd.read_csv(path, usecols=key_cols)
+    df["selection"] = selection
+    records.append(df)
+
+all_keys = pd.concat(records, ignore_index=True)
+
+for col in key_cols:
+    present = all_keys[col].notna()
+    shared_values = all_keys.loc[present, ["selection", col]].drop_duplicates()[col].duplicated(keep=False)
+    shared_count = int(shared_values.sum())
+    print(f"{col}: {shared_count} values shared across multiple selection types")
+
+"""
+
+selection_types = ['Stability', 'Binding', 'Expression', 'OrganismalFitness', 'Activity']
+data_dir = "/gpfs/scratch/jv2807/dms_data/datasets"
+
+all_selection_types = pd.concat(
+    (
+        pd.read_csv(f"{data_dir}/{selection}.csv").assign(coarse_selection_type=selection)
+        for selection in selection_types
+    ),
+    ignore_index=True,
+    copy=False,
+)
+print(all_selection_types.head())
+all_selection_types.to_csv(f"{data_dir}/all_selection_types.csv", index=False)

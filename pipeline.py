@@ -88,6 +88,7 @@ def parse_args():
     parser.add_argument('--train_same_gene_batch', action='store_true', help='for training, whether to use a gene-aware train loader that creates batches of variants from the same gene, rather than random batches - if --same_gene_batch is set, this is automatically set to True', default=False)
     parser.add_argument('--train_different_gene_batch', action='store_true')
     parser.add_argument('--eval_regression', action='store_true')
+    parser.add_argument('--selection_types', type=str, nargs='+', required=True)
 
     # LoRA finetuning args
     parser.add_argument('--use_lora', action='store_true', default=False, 
@@ -194,9 +195,6 @@ if args.ohe_baseline:
     esm_model_llr, esm_alphabet_llr = esm.pretrained.esm2_t33_650M_UR50D()
     esm_batch_converter_llr = esm_alphabet_llr.get_batch_converter()
 
-ESMEmbeddingLoader = None
-OHEEmbeddingLoader = None
-
 if args.model_path is not None and args.split_file is None:
     DATA_SPLIT_PATH = f'{os.path.dirname(args.model_path)}/data_split.json'
     if not os.path.exists(DATA_SPLIT_PATH):
@@ -251,13 +249,14 @@ def esm_batch(sequences):
     return embeddings_batch
 
 class DMSContrastiveDataset(Dataset):
-    def __init__(self, sequences, quartiles, dms_scores, genes, mutants=None):
+    def __init__(self, sequences, quartiles, dms_scores, genes, mutants=None, coarse_selection_types=None):
         self.sequences = sequences
         self.quartiles = quartiles
         self.dms_scores = dms_scores
         #self.seq_to_embedding = seq_to_embedding
         self.genes = genes
         self.mutants = mutants
+        self.coarse_selection_types = coarse_selection_types
 
     def __len__(self):
         return len(self.sequences)
@@ -268,6 +267,7 @@ class DMSContrastiveDataset(Dataset):
         dms_score = self.dms_scores[idx]
         gene = self.genes[idx]
         mutant = self.mutants[idx] if self.mutants is not None else None
+        coarse_selection_type = self.coarse_selection_types[idx] if self.coarse_selection_types is not None else None
 
         #get precomputed embedding
         #emb = self.seq_to_embedding[seq]
@@ -277,14 +277,25 @@ class DMSContrastiveDataset(Dataset):
             'dms_score': dms_score,
             'sequence': sequence,
             'gene': gene,
-            'mutant': mutant
+            'mutant': mutant,
+            'coarse_selection_type': coarse_selection_type
         }
 
-def load_embeddings_h5(sequences, embedding_loader, embedding_type, mutants=None, wt_seqs=None):
+def load_embeddings_h5(sequences, embedding_loader, embedding_type, mutants=None, wt_seqs=None, coarse_selection_types=None):
     if embedding_loader is None:
         raise ValueError("embedding_loader must be specified")
     if embedding_type not in ['esm', 'ohe']:
         raise ValueError("embedding_type must be 'esm' or 'ohe'")
+    if isinstance(embedding_loader, dict):
+        if coarse_selection_types is None:
+            raise ValueError("coarse_selection_types must be provided when embedding_loader is a dict")
+        unique_selection_types = set(coarse_selection_types)
+        if len(unique_selection_types) != 1:
+            raise ValueError(f"Batch contains multiple coarse selection types: {sorted(unique_selection_types)}") #we could maybe change this in the future.. if we want multiple selection types but only one gene per batch, we can probably still get the embedding from either of the embedding loaders
+        selection_type = next(iter(unique_selection_types))
+        if selection_type not in embedding_loader:
+            raise ValueError(f"Missing embedding loader for selection type: {selection_type}")
+        embedding_loader = embedding_loader[selection_type]
         
     embeddings, missing_seqs, missing_indices = embedding_loader.load_embeddings(sequences)
     #print(f'len embeddings: {len(embeddings)}')
@@ -316,7 +327,7 @@ def load_embeddings_h5(sequences, embedding_loader, embedding_type, mutants=None
     return embeddings
 
 class DataLoader():
-    def __init__(self, dataset, batch_size=16, shuffle=True, balance_quartiles=True, gene_to_wt=None, gene_aware=False):
+    def __init__(self, dataset, batch_size=16, shuffle=True, balance_quartiles=True, gene_to_wt=None, gene_aware=False, esm_embedding_loaders=None, ohe_embedding_loaders=None):
         self.dataset = dataset
         self.batch_size = batch_size
         self.shuffle = shuffle
@@ -324,6 +335,8 @@ class DataLoader():
         self.gene_to_wt = gene_to_wt
         self.gene_aware = gene_aware
         self.load_ohe = False
+        self.esm_embedding_loaders = esm_embedding_loaders
+        self.ohe_embedding_loaders = ohe_embedding_loaders
 
         if self.gene_aware == False and self.shuffle==False:
             raise ValueError('If gene_aware is False, shuffle must be True - otherwise it is not truly different-gene batches')
@@ -414,23 +427,41 @@ class DataLoader():
         dms_scores = [item['dms_score'] for item in batch]
         sequences = [item['sequence'] for item in batch]
         genes = [item['gene'] for item in batch]
+        coarse_selection_types = [item['coarse_selection_type'] for item in batch]
 
         if args.normalize_to_wt:
             wt_sequences = [self.gene_to_wt[gene] for gene in genes]
-            wt_embeddings = load_embeddings_h5(wt_sequences, embedding_loader=ESMEmbeddingLoader, embedding_type='esm')
+            wt_embeddings = load_embeddings_h5(
+                wt_sequences,
+                embedding_loader=self.esm_embedding_loaders,
+                embedding_type='esm',
+                coarse_selection_types=coarse_selection_types,
+            )
         else:
             wt_embeddings = None
 
         if args.ohe_baseline and self.gene_aware and self.load_ohe:
             #print('gene-aware ohe batch iteration')
             mutants = [item['mutant'] for item in batch]
-            ohe_features = load_embeddings_h5(sequences, embedding_loader=OHEEmbeddingLoader, embedding_type='ohe', mutants=mutants, wt_seqs=wt_sequences)
+            ohe_features = load_embeddings_h5(
+                sequences,
+                embedding_loader=self.ohe_embedding_loaders,
+                embedding_type='ohe',
+                mutants=mutants,
+                wt_seqs=wt_sequences,
+                coarse_selection_types=coarse_selection_types,
+            )
         else:
             ohe_features = None
             mutants = None
 
         if not args.use_lora:
-            embeddings = load_embeddings_h5(sequences, embedding_loader=ESMEmbeddingLoader, embedding_type='esm')
+            embeddings = load_embeddings_h5(
+                sequences,
+                embedding_loader=self.esm_embedding_loaders,
+                embedding_type='esm',
+                coarse_selection_types=coarse_selection_types,
+            )
         else:
             embeddings = None
 
@@ -439,6 +470,7 @@ class DataLoader():
             'dms_scores': dms_scores,
             'sequences': sequences,
             'genes': genes,
+            'coarse_selection_types': coarse_selection_types,
             'wt_embeddings': wt_embeddings,
             'embeddings': embeddings,
             'ohe_features': ohe_features,
@@ -593,6 +625,13 @@ def load_and_preprocess_data(data_path):
     print(f"Loading data from {data_path}")
     df = pd.read_csv(data_path)
     original_length = len(df)
+
+    if 'coarse_selection_type' not in df.columns:
+        raise ValueError("Input data must contain 'coarse_selection_type' column when using --selection_types")
+    before_filter_len = len(df)
+    df = df[df['coarse_selection_type'].isin(args.selection_types)].copy()
+    if len(df) < before_filter_len:
+        print(f"WARNING: filtered dataset by --selection_types {args.selection_types}; removed {before_filter_len - len(df)} rows")
 
     df = df.dropna(subset=['DMS_score', 'mutated_sequence', 'filename'])
 
@@ -1719,11 +1758,13 @@ def main():
     train_quarts = train_df['quartile'].tolist()
     train_dms = train_df['DMS_score'].tolist()
     train_genes = train_df['filename'].tolist()
+    train_coarse_selection_types = train_df['coarse_selection_type'].tolist()
 
     test_seqs = test_df['mutated_sequence'].tolist()
     test_quarts = test_df['quartile'].tolist()
     test_dms = test_df['DMS_score'].tolist()
     test_genes = test_df['filename'].tolist()
+    test_coarse_selection_types = test_df['coarse_selection_type'].tolist()
     if args.ohe_baseline:
         test_mutants = test_df['mutant'].tolist()
         train_mutants = train_df['mutant'].tolist()
@@ -1734,15 +1775,34 @@ def main():
     print(f'train seq length distribution: {pd.Series(train_seqs).str.len().describe()}')
     print(f'test seq length distribution: {pd.Series(test_seqs).str.len().describe()}')
 
-    #init h5 file for embeddings
-    if args.embeddings_path is not None:
-        global ESMEmbeddingLoader
-        ESMEmbeddingLoader = h5_utils.EmbeddingLoader(args.embeddings_path, original_length*1.05, embed_dim=args.input_dim)
-    else:
+    #init h5 files for embeddings
+    if args.embeddings_path is None:
         raise ValueError("Embeddings path must be specified")
+    if '{selection_type}' not in args.embeddings_path:
+        raise ValueError("--embeddings_path must contain '{selection_type}'")
+    esm_embedding_loaders = {
+        selection_type: h5_utils.EmbeddingLoader(
+            args.embeddings_path.replace('{selection_type}', selection_type),
+            original_length*1.05,
+            embed_dim=args.input_dim,
+        )
+        for selection_type in args.selection_types
+    }
     if args.ohe_baseline:
-        global OHEEmbeddingLoader
-        OHEEmbeddingLoader = h5_utils.EmbeddingLoader(args.ohe_embeddings_path, original_length*1.05, embed_dim=20*args.esm_max_length)
+        if args.ohe_embeddings_path is None:
+            raise ValueError("--ohe_embeddings_path must be specified when --ohe_baseline is set")
+        if '{selection_type}' not in args.ohe_embeddings_path:
+            raise ValueError("--ohe_embeddings_path must contain '{selection_type}'")
+        ohe_embedding_loaders = {
+            selection_type: h5_utils.EmbeddingLoader(
+                args.ohe_embeddings_path.replace('{selection_type}', selection_type),
+                original_length*1.05,
+                embed_dim=20*args.esm_max_length,
+            )
+            for selection_type in args.selection_types
+        }
+    else:
+        ohe_embedding_loaders = None
 
     #create datasets
     if args.split_by_gene:
@@ -1750,22 +1810,22 @@ def main():
     else:
         print('WARNING: NOT splitting train/test set by gene')
     train_dataset = DMSContrastiveDataset(train_seqs, train_quarts, train_dms,
-                                          train_genes, train_mutants)
+                                          train_genes, train_mutants, train_coarse_selection_types)
     test_dataset = DMSContrastiveDataset(test_seqs, test_quarts, test_dms,
-                                         test_genes, test_mutants)
+                                         test_genes, test_mutants, test_coarse_selection_types)
 
     #create data loaders
     if args.train_same_gene_batch:
-        train_loader = DataLoader(train_dataset, batch_size=BATCH_SIZE, gene_to_wt = gene_to_wt, shuffle=True, gene_aware=True)
+        train_loader = DataLoader(train_dataset, batch_size=BATCH_SIZE, gene_to_wt = gene_to_wt, shuffle=True, gene_aware=True, esm_embedding_loaders=esm_embedding_loaders, ohe_embedding_loaders=ohe_embedding_loaders)
     elif args.train_different_gene_batch:
-        train_loader = DataLoader(train_dataset, batch_size=BATCH_SIZE, gene_to_wt = gene_to_wt, shuffle=True, gene_aware=False)
+        train_loader = DataLoader(train_dataset, batch_size=BATCH_SIZE, gene_to_wt = gene_to_wt, shuffle=True, gene_aware=False, esm_embedding_loaders=esm_embedding_loaders, ohe_embedding_loaders=ohe_embedding_loaders)
     else:
         raise ValueError("Must specify either --train_same_gene_batch or --train_different_gene_batch")
 
     if args.test_same_gene_batch:
-        test_loader = DataLoader(test_dataset, batch_size=BATCH_SIZE, gene_to_wt = gene_to_wt, shuffle=False, gene_aware=True)
+        test_loader = DataLoader(test_dataset, batch_size=BATCH_SIZE, gene_to_wt = gene_to_wt, shuffle=False, gene_aware=True, esm_embedding_loaders=esm_embedding_loaders, ohe_embedding_loaders=ohe_embedding_loaders)
     elif args.test_different_gene_batch:
-        test_loader = DataLoader(test_dataset, batch_size=BATCH_SIZE, gene_to_wt = gene_to_wt, shuffle=True, gene_aware=False)
+        test_loader = DataLoader(test_dataset, batch_size=BATCH_SIZE, gene_to_wt = gene_to_wt, shuffle=True, gene_aware=False, esm_embedding_loaders=esm_embedding_loaders, ohe_embedding_loaders=ohe_embedding_loaders)
     else:
         raise ValueError("Must specify either --test_same_gene_batch or --test_different_gene_batch")
 
@@ -1904,7 +1964,7 @@ def main():
         #ohe_llr_baseline(loss_fn, gene_aware_test_loader)
         
         if args.test_different_gene_batch:
-            gene_aware_test_loader = DataLoader(test_dataset, batch_size=BATCH_SIZE, gene_to_wt = gene_to_wt, shuffle=False, gene_aware=True)
+            gene_aware_test_loader = DataLoader(test_dataset, batch_size=BATCH_SIZE, gene_to_wt = gene_to_wt, shuffle=False, gene_aware=True, esm_embedding_loaders=esm_embedding_loaders, ohe_embedding_loaders=ohe_embedding_loaders)
         else:
             gene_aware_test_loader = test_loader
         if args.eval_regression:
@@ -1944,8 +2004,11 @@ def main():
                               "Projected Embeddings (DMS Colored)")
     """
 
-    ESMEmbeddingLoader.close_h5()
-    OHEEmbeddingLoader.close_h5()
+    for loader in esm_embedding_loaders.values():
+        loader.close_h5()
+    if ohe_embedding_loaders is not None:
+        for loader in ohe_embedding_loaders.values():
+            loader.close_h5()
 
 if __name__ == '__main__':
     main()
