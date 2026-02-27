@@ -79,6 +79,7 @@ def parse_args():
     parser.add_argument('--metadata_path', default=None)
     parser.add_argument('--normalize_to_wt', action='store_true', default=False)
     parser.add_argument('--ohe_baseline', action='store_true', default=False)
+    parser.add_argument('--num_bootstraps', type=int, default=20)
     parser.add_argument('--model_path', type=str, default=None, help='path to pre-trained PROJECTION HEAD')
     parser.add_argument('--esm_variants_module_path', default='/gpfs/home/jv2807/dms_contrastive/esm-variants')
     parser.add_argument('--split_file', type=str, default=None, help='path to json file specifying train/test split')
@@ -1080,12 +1081,12 @@ def ohe_llr_baseline(batches, projection_net, train_size=None):
         if should_evaluate:
             if args.eval_regression:
                 #ridge baseline:
-                mse = ridge_regression_metrics(train_encodings, train_scores, test_encodings, test_scores)
-                gene_to_metrics['baseline']['positional_split'][current_gene] = {'ridge': mse}
+                spearman_r, p = ridge_regression_metrics(train_encodings, train_scores, test_encodings, test_scores)
+                gene_to_metrics['baseline']['positional_split'][current_gene] = {'ridge': {'sperman_r': spearman_r, 'p-value': p}}
 
                 #ridge projections:
-                mse = ridge_regression_metrics(train_projections, train_scores, test_projections, test_scores)
-                gene_to_metrics['projections']['positional_split'][current_gene] = {'ridge': mse}
+                spearman_r, p = ridge_regression_metrics(train_projections, train_scores, test_projections, test_scores)
+                gene_to_metrics['projections']['positional_split'][current_gene] = {'ridge': {'sperman_r': spearman_r, 'p-value': p}}
 
 
             else:
@@ -1252,9 +1253,10 @@ def ohe_llr_baseline(batches, projection_net, train_size=None):
     if args.eval_regression:
         with open(RESULTS_FILE, 'a') as f:
             for model in ['baseline', 'projections']:
-                mse = np.mean([gene_to_metrics[model]['positional_split'][gene]['ridge'] for gene in gene_to_metrics[model]['positional_split']])
-                print(f'Average MSE: {mse}')
-                f.write(f'{RUN_NAME}_{model}_positionalsplit_ridgeregression_MSE_{train_size:g},{mse},-,-,-,-,-\n')
+                spearman_r = np.mean([gene_to_metrics[model]['positional_split'][gene]['ridge']['spearman_r'] for gene in gene_to_metrics[model]['positional_split']])
+                p_value = np.mean([gene_to_metrics[model]['positional_split'][gene]['ridge']['p-value'] for gene in gene_to_metrics[model]['positional_split']])
+                print(f'Average spearman r: {spearman_r}, p={p_value}')
+                f.write(f'{RUN_NAME}_{model}_positionalsplit_ridgeregression_spearman_r_{train_size:g},{spearman_r},{p_value},-,-,-,-\n')
     else:
         with open(RESULTS_FILE, 'a') as f:
             for split_type in ['random_split', 'positional_split']:
@@ -1321,85 +1323,86 @@ def classification_comparison_by_train_size(projection_net, dataloader, device, 
         dicts[train_size] = {}
         for i in range(num_bootstraps):
             dicts[train_size][i] = ohe_llr_baseline(batches, projection_net, train_size=train_size)
-    
-    metrics = {}
-    metrics['zero_shot_llr'] = llr_metrics
-    #plot results
-    for split_type in ['random_split', 'positional_split']:
-        metrics[split_type] = {}
-        for classifier in ['ridge']: #['knn', 'ridge']
-            metrics[split_type][classifier] = {}
-            for model in ['baseline', 'projections']:
-                metrics[split_type][classifier][model] = {'auc': {'avg': {}, 'std': {}, 'ci': {}},
-                                                        'acc': {'avg': {}, 'std': {}, 'ci': {}}}
-                for train_size in train_sizes:
-                    accs = []
-                    aucs = []
-                    for i in range(num_bootstraps):
-                        acc = np.mean([dicts[train_size][i][model][split_type][gene][classifier][0] for gene in dicts[train_size][i][model][split_type]])
-                        auc = np.mean([dicts[train_size][i][model][split_type][gene][classifier][4] for gene in dicts[train_size][i][model][split_type]])
-                        accs.append(acc)
-                        aucs.append(auc)
-                    
-                    # Calculate statistics
-                    t_critical = stats.t.ppf(0.975, df=num_bootstraps-1)
-                    for metric_name, values in [('auc', aucs), ('acc', accs)]:
-                        avg = np.mean(values)
-                        std = np.std(values)
-                        ci = t_critical * std / np.sqrt(num_bootstraps)
-                        
-                        metrics[split_type][classifier][model][metric_name]['avg'].update({train_size: avg})
-                        metrics[split_type][classifier][model][metric_name]['std'].update({train_size: std})
-                        metrics[split_type][classifier][model][metric_name]['ci'].update({train_size: ci})
-        
-        
-        for metric_type in ['auc', 'acc']:
-            plt.figure()
-            #plt.plot(train_sizes, list(metrics[split_type]['knn']['baseline'][metric_type]['avg'].values()), label='OHE+LLR Baseline (KNN)', marker='o')
-            #plt.plot(train_sizes, list(metrics[split_type]['knn']['projections'][metric_type]['avg'].values()), label='Learned Projections (KNN)', marker='o')
-            plt.plot(train_sizes, list(metrics[split_type]['ridge']['baseline'][metric_type]['avg'].values()), label='OHE+LLR Baseline (Ridge)', marker='s')
-            plt.plot(train_sizes, list(metrics[split_type]['ridge']['projections'][metric_type]['avg'].values()), label='Learned Projections (Ridge)', marker='s')
-            plt.axhline(y=llr_metrics[metric_type], label='LLR Score Alone', color='gray', linestyle='--', linewidth=2)
-            
-            # Add error bars
+
+    if not args.eval_regression:
+        metrics = {}
+        metrics['zero_shot_llr'] = llr_metrics
+        #plot results
+        for split_type in ['random_split', 'positional_split']:
+            metrics[split_type] = {}
             for classifier in ['ridge']: #['knn', 'ridge']
+                metrics[split_type][classifier] = {}
                 for model in ['baseline', 'projections']:
-                    plt.errorbar(train_sizes, list(metrics[split_type][classifier][model][metric_type]['avg'].values()), 
-                                yerr=list(metrics[split_type][classifier][model][metric_type]['ci'].values()), fmt='none', 
-                                capsize=5, alpha=0.5, ecolor='black')
-                    #plt.errorbar(train_sizes, list(metrics[split_type][classifier][model][metric_type]['avg'].values()), 
-                    #            yerr=list(metrics[split_type][classifier][model][metric_type]['std'].values()), fmt='none', 
-                    #            capsize=5, alpha=0.5, ecolor='red')
+                    metrics[split_type][classifier][model] = {'auc': {'avg': {}, 'std': {}, 'ci': {}},
+                                                            'acc': {'avg': {}, 'std': {}, 'ci': {}}}
+                    for train_size in train_sizes:
+                        accs = []
+                        aucs = []
+                        for i in range(num_bootstraps):
+                            acc = np.mean([dicts[train_size][i][model][split_type][gene][classifier][0] for gene in dicts[train_size][i][model][split_type]])
+                            auc = np.mean([dicts[train_size][i][model][split_type][gene][classifier][4] for gene in dicts[train_size][i][model][split_type]])
+                            accs.append(acc)
+                            aucs.append(auc)
+                        
+                        # Calculate statistics
+                        t_critical = stats.t.ppf(0.975, df=num_bootstraps-1)
+                        for metric_name, values in [('auc', aucs), ('acc', accs)]:
+                            avg = np.mean(values)
+                            std = np.std(values)
+                            ci = t_critical * std / np.sqrt(num_bootstraps)
+                            
+                            metrics[split_type][classifier][model][metric_name]['avg'].update({train_size: avg})
+                            metrics[split_type][classifier][model][metric_name]['std'].update({train_size: std})
+                            metrics[split_type][classifier][model][metric_name]['ci'].update({train_size: ci})
             
-            plt.xlabel('Training Set Size')
-            plt.ylabel(f'Average {metric_type.upper()}')
-            plt.title(f'{metric_type.upper()} vs Training Set Size ({split_type}, {num_bootstraps} bootstraps)')
-            plt.legend(loc='upper left', bbox_to_anchor=(1, 1))
-            plt.grid(True, alpha=0.3)
-            plt.savefig(f'{plot_dir}/{metric_type}_vs_train_size_{split_type}.png', bbox_inches='tight')
-            plt.close()
+            
+            for metric_type in ['auc', 'acc']:
+                plt.figure()
+                #plt.plot(train_sizes, list(metrics[split_type]['knn']['baseline'][metric_type]['avg'].values()), label='OHE+LLR Baseline (KNN)', marker='o')
+                #plt.plot(train_sizes, list(metrics[split_type]['knn']['projections'][metric_type]['avg'].values()), label='Learned Projections (KNN)', marker='o')
+                plt.plot(train_sizes, list(metrics[split_type]['ridge']['baseline'][metric_type]['avg'].values()), label='OHE+LLR Baseline (Ridge)', marker='s')
+                plt.plot(train_sizes, list(metrics[split_type]['ridge']['projections'][metric_type]['avg'].values()), label='Learned Projections (Ridge)', marker='s')
+                plt.axhline(y=llr_metrics[metric_type], label='LLR Score Alone', color='gray', linestyle='--', linewidth=2)
+                
+                # Add error bars
+                for classifier in ['ridge']: #['knn', 'ridge']
+                    for model in ['baseline', 'projections']:
+                        plt.errorbar(train_sizes, list(metrics[split_type][classifier][model][metric_type]['avg'].values()), 
+                                    yerr=list(metrics[split_type][classifier][model][metric_type]['ci'].values()), fmt='none', 
+                                    capsize=5, alpha=0.5, ecolor='black')
+                        #plt.errorbar(train_sizes, list(metrics[split_type][classifier][model][metric_type]['avg'].values()), 
+                        #            yerr=list(metrics[split_type][classifier][model][metric_type]['std'].values()), fmt='none', 
+                        #            capsize=5, alpha=0.5, ecolor='red')
+                
+                plt.xlabel('Training Set Size')
+                plt.ylabel(f'Average {metric_type.upper()}')
+                plt.title(f'{metric_type.upper()} vs Training Set Size ({split_type}, {num_bootstraps} bootstraps)')
+                plt.legend(loc='upper left', bbox_to_anchor=(1, 1))
+                plt.grid(True, alpha=0.3)
+                plt.savefig(f'{plot_dir}/{metric_type}_vs_train_size_{split_type}.png', bbox_inches='tight')
+                plt.close()
+            
         
-    
-    # Save metrics to JSON
-    with open(f'{plot_dir}/metrics_full.json', 'w') as f:
-        json.dump(metrics, f, indent=2)
-    """
-    metrics_json = {}
-    for split_type in ['random_split', 'positional_split']:
-        metrics_json[split_type] = {}
-        for metric_type in ['auc', 'acc']:
-            metrics_json[split_type][metric_type] = {}
-            for stat_type in ['avg', 'ci', 'std']:
-                metrics_json[split_type][metric_type][stat_type] = {}
-                for classifier in ['knn', 'ridge']:
-                    metrics_json[split_type][metric_type][stat_type][classifier] = {
-                        model: [float(v) for v in metrics[split_type][metric_type][stat_type][classifier][model]]
-                        for model in ['baseline', 'projections']
-                    }
-    
-    with open(f'{plot_dir}/metrics.json', 'w') as f:
-        json.dump(metrics_json, f, indent=2)
+        # Save metrics to JSON
+        with open(f'{plot_dir}/metrics_full.json', 'w') as f:
+            json.dump(metrics, f, indent=2)
         """
+        metrics_json = {}
+        for split_type in ['random_split', 'positional_split']:
+            metrics_json[split_type] = {}
+            for metric_type in ['auc', 'acc']:
+                metrics_json[split_type][metric_type] = {}
+                for stat_type in ['avg', 'ci', 'std']:
+                    metrics_json[split_type][metric_type][stat_type] = {}
+                    for classifier in ['knn', 'ridge']:
+                        metrics_json[split_type][metric_type][stat_type][classifier] = {
+                            model: [float(v) for v in metrics[split_type][metric_type][stat_type][classifier][model]]
+                            for model in ['baseline', 'projections']
+                        }
+        
+        with open(f'{plot_dir}/metrics.json', 'w') as f:
+            json.dump(metrics_json, f, indent=2)
+            """
 def get_ohe_features(wt_sequences, mutants):
     #to be used in DataLoader / collate_batch
 
@@ -1981,7 +1984,7 @@ def main():
             batches = precompute_batches(gene_aware_test_loader, projection_net)
             ohe_llr_baseline(batches, projection_net)
         else:
-            classification_comparison_by_train_size(projection_net, gene_aware_test_loader, device, train_sizes=[.025, .05, .1, .2, .4, .6, .8, 1.0], num_bootstraps=20)
+            classification_comparison_by_train_size(projection_net, gene_aware_test_loader, device, train_sizes=[.025, .05, .1, .2, .4, .6, .8, 1.0], num_bootstraps=args.num_bootstraps)
         
 
 

@@ -14,10 +14,10 @@ BASE_DATA_PATH="/gpfs/scratch/jv2807/dms_data"
 
 EMBEDDING_LAYER="layer33_mean"
 
-for COARSE_SELECTION_TYPE in "Stability" "OrganismalFitness" "Activity" "Expression"  ; do
+for COARSE_SELECTION_TYPE in "Stability" "OrganismalFitness" "Activity" "Expression" "Binding" ; do
     echo "Running ${COARSE_SELECTION_TYPE} ${EMBEDDING_LAYER}"
 
-    RUN_NAME="esmc_figures_${COARSE_SELECTION_TYPE}"
+    RUN_NAME="esmc_spearmanr_${COARSE_SELECTION_TYPE}"
 
     python -u pipeline.py --run_name $RUN_NAME \
         --data_path $BASE_DATA_PATH/datasets/${COARSE_SELECTION_TYPE}.csv \
@@ -43,6 +43,8 @@ for COARSE_SELECTION_TYPE in "Stability" "OrganismalFitness" "Activity" "Express
         --split_by_gene \
         --split_file /gpfs/home/jv2807/dms_contrastive/results/650M_splitbygene_lora2_${COARSE_SELECTION_TYPE}_layer33_mean/data_split.json \
         --ohe_baseline \
+        --eval_regression \
+        --num_bootstraps 1 \
         --model_path /gpfs/home/jv2807/dms_contrastive/results/600M_esmc_NWT_${COARSE_SELECTION_TYPE}/model.pt \
         --selection_types ${COARSE_SELECTION_TYPE}
 

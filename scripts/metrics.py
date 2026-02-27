@@ -5,6 +5,7 @@ import numpy as np
 from sklearn.neighbors import KNeighborsClassifier
 from sklearn.linear_model import RidgeClassifier, Ridge
 from sklearn.metrics import roc_auc_score, mean_squared_error
+from scipy.stats import spearmanr
 
 
 def ridge_metrics(train_projections, train_quartiles, test_projections, test_quartiles):
@@ -32,9 +33,10 @@ def ridge_regression_metrics(train_projections, train_scores, test_projections, 
 
     preds = ridge.predict(test_projections)
 
-    mse = mean_squared_error(test_scores, preds)
+    r, p = spearmanr(test_scores, preds)
+    #mse = mean_squared_error(test_scores, preds)
     
-    return mse
+    return r, p
 
 
 
