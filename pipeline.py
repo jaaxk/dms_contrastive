@@ -1355,14 +1355,14 @@ def classification_comparison_by_train_size(projection_net, dataloader, device, 
         
         for metric_type in ['auc', 'acc']:
             plt.figure()
-            plt.plot(train_sizes, list(metrics[split_type]['knn']['baseline'][metric_type]['avg'].values()), label='OHE+LLR Baseline (KNN)', marker='o')
-            plt.plot(train_sizes, list(metrics[split_type]['knn']['projections'][metric_type]['avg'].values()), label='Learned Projections (KNN)', marker='o')
+            #plt.plot(train_sizes, list(metrics[split_type]['knn']['baseline'][metric_type]['avg'].values()), label='OHE+LLR Baseline (KNN)', marker='o')
+            #plt.plot(train_sizes, list(metrics[split_type]['knn']['projections'][metric_type]['avg'].values()), label='Learned Projections (KNN)', marker='o')
             plt.plot(train_sizes, list(metrics[split_type]['ridge']['baseline'][metric_type]['avg'].values()), label='OHE+LLR Baseline (Ridge)', marker='s')
             plt.plot(train_sizes, list(metrics[split_type]['ridge']['projections'][metric_type]['avg'].values()), label='Learned Projections (Ridge)', marker='s')
             plt.axhline(y=llr_metrics[metric_type], label='LLR Score Alone', color='gray', linestyle='--', linewidth=2)
             
             # Add error bars
-            for classifier in ['knn', 'ridge']:
+            for classifier in ['ridge']: #['knn', 'ridge']
                 for model in ['baseline', 'projections']:
                     plt.errorbar(train_sizes, list(metrics[split_type][classifier][model][metric_type]['avg'].values()), 
                                 yerr=list(metrics[split_type][classifier][model][metric_type]['ci'].values()), fmt='none', 
