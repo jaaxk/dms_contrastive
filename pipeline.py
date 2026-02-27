@@ -1486,6 +1486,7 @@ def train(projection_net, loss_fn, train_loader, test_loader, optimizer, device)
     print('Training...')
     from transformers import get_cosine_schedule_with_warmup
     import wandb
+    import copy
     run = wandb.init(project=args.wandb_project, name=RUN_NAME, entity=args.wandb_entity, config=args.__dict__)
     
     train_losses = []
@@ -1629,17 +1630,19 @@ def train(projection_net, loss_fn, train_loader, test_loader, optimizer, device)
                     if val_auc > best_val_auc:
                         best_val_auc = val_auc
                         patience_counter = 0
-                        best_model_state = projection_net.state_dict().copy()
+                        best_model_state = copy.deepcopy(projection_net.state_dict())
                         if args.use_lora and esm_model is not None:
-                            best_esm_state = esm_model.state_dict().copy()
-                            best_esm_optimizer_state = esm_optimizer.state_dict().copy()
-                        best_optimizer_state = optimizer.state_dict().copy()
+                            best_esm_state = copy.deepcopy(esm_model.state_dict())
+                            best_esm_optimizer_state = copy.deepcopy(esm_optimizer.state_dict())
+
+                        best_optimizer_state = copy.deepcopy(optimizer.state_dict())
                         print(f" Step {global_step+1}: New best val auc: {best_val_auc:.4f}")
 
                         torch.save({
                             'model_state_dict': best_model_state,
                             'optimizer_state_dict': best_optimizer_state,
                             'esm_model_state_dict': best_esm_state if args.use_lora else None,
+                            'esm_model_optimizer_state_dict': best_esm_optimizer_state if args.use_lora else None,
                             'train_losses': train_losses,
                             'val_losses': val_losses,
                             'global_step': global_step,
