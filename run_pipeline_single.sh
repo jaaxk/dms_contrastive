@@ -14,7 +14,7 @@ BASE_DATA_PATH="/gpfs/scratch/jv2807/dms_data"
 
 EMBEDDING_LAYER="layer33_mean"
 
-RUN_NAME="all_selection_types_LORA_600M_esmc_NWT_eval_spearmanr"
+RUN_NAME="all_selection_types_LORA_600M_esmc_NWT_eval_pertype"
 
 python -u pipeline.py --run_name $RUN_NAME \
     --data_path $BASE_DATA_PATH/datasets/all_selection_types.csv \
@@ -42,8 +42,7 @@ python -u pipeline.py --run_name $RUN_NAME \
     --lora_alpha 32 \
     --esm_lr .000005 \
     --lora_target_modules layernorm_qkv.1 \
-    --model_path /gpfs/home/jv2807/dms_contrastive/results/all_selection_types_LORA_600M_esmc_NWT/temp_model_epoch3.pt \
-    --eval_regression
+    --model_path /gpfs/home/jv2807/dms_contrastive/results/all_selection_types_LORA_600M_esmc_NWT/temp_model_epoch3.pt
 
 #        --use_lora \
 #--model_name facebook/esm2_t33_650M_UR50D \

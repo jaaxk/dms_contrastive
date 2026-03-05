@@ -1981,11 +1981,26 @@ def main():
             gene_aware_test_loader = DataLoader(test_dataset, batch_size=BATCH_SIZE, gene_to_wt = gene_to_wt, shuffle=False, gene_aware=True, esm_embedding_loaders=esm_embedding_loaders, ohe_embedding_loaders=ohe_embedding_loaders)
         else:
             gene_aware_test_loader = test_loader
-        if args.eval_regression:
-            batches = precompute_batches(gene_aware_test_loader, projection_net)
-            ohe_llr_baseline(batches, projection_net)
-        else:
-            classification_comparison_by_train_size(projection_net, gene_aware_test_loader, device, train_sizes=[.025, .05, .1, .2, .4, .6, .8, 1.0], num_bootstraps=args.num_bootstraps)
+
+        #per-selection-type eval
+        for selection_type in args.selection_types:
+            temp_df = test_df[test_df['coarse_selection_type']==selection_type]
+            test_seqs = temp_df['mutated_sequence'].tolist()
+            test_quarts = temp_df['quartile'].tolist()
+            test_dms = temp_df['DMS_score'].tolist()
+            test_genes = temp_df['filename'].tolist()
+            test_coarse_selection_types = temp_df['coarse_selection_type'].tolist()
+            test_mutants = temp_df['mutant'].tolist()
+            temp_dataset = DMSContrastiveDataset(test_seqs, test_quarts, test_dms,
+                                            test_genes, test_mutants, test_coarse_selection_types)
+            temp_loader = DataLoader(temp_dataset, batch_size=BATCH_SIZE, gene_to_wt = gene_to_wt, shuffle=False, gene_aware=True, esm_embedding_loaders=esm_embedding_loaders, ohe_embedding_loaders=ohe_embedding_loaders)
+
+
+            if args.eval_regression:
+                batches = precompute_batches(gene_aware_test_loader, projection_net)
+                ohe_llr_baseline(batches, projection_net)
+            else:
+                classification_comparison_by_train_size(projection_net, temp_loader, device, train_sizes=[.025, .05, .1, .2, .4, .6, .8, 1.0], num_bootstraps=args.num_bootstraps)
         
 
 
