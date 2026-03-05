@@ -1300,7 +1300,7 @@ def precompute_batches(dataloader, projection_net):
     return batches
     
 
-def classification_comparison_by_train_size(projection_net, dataloader, device, num_bootstraps=10, train_sizes=[.05, .1, .2, .4, .6, .8]):
+def classification_comparison_by_train_size(projection_net, dataloader, device, num_bootstraps=10, train_sizes=[.05, .1, .2, .4, .6, .8], selection_type=''):
     #run classification comparison at different train sizes for OHE+LLR baseline vs learned projections
     #then plot performance vs train size
     #dataloader must NOT be shuffled and MUST be gene-aware
@@ -1380,12 +1380,12 @@ def classification_comparison_by_train_size(projection_net, dataloader, device, 
                 plt.title(f'{metric_type.upper()} vs Training Set Size ({split_type}, {num_bootstraps} bootstraps)')
                 plt.legend(loc='upper left', bbox_to_anchor=(1, 1))
                 plt.grid(True, alpha=0.3)
-                plt.savefig(f'{plot_dir}/{metric_type}_vs_train_size_{split_type}.png', bbox_inches='tight')
+                plt.savefig(f'{plot_dir}/{metric_type}_vs_train_size_{split_type}_{selection_type}.png', bbox_inches='tight')
                 plt.close()
             
         
         # Save metrics to JSON
-        with open(f'{plot_dir}/metrics_full.json', 'w') as f:
+        with open(f'{plot_dir}/metrics_full_{selection_type}.json', 'w') as f:
             json.dump(metrics, f, indent=2)
         """
         metrics_json = {}
@@ -1984,6 +1984,7 @@ def main():
 
         #per-selection-type eval
         for selection_type in args.selection_types:
+            print(f'evaluating {selection_type}')
             temp_df = test_df[test_df['coarse_selection_type']==selection_type]
             test_seqs = temp_df['mutated_sequence'].tolist()
             test_quarts = temp_df['quartile'].tolist()
@@ -1991,6 +1992,7 @@ def main():
             test_genes = temp_df['filename'].tolist()
             test_coarse_selection_types = temp_df['coarse_selection_type'].tolist()
             test_mutants = temp_df['mutant'].tolist()
+            print(f'{len(test_seqs)} sequences')
             temp_dataset = DMSContrastiveDataset(test_seqs, test_quarts, test_dms,
                                             test_genes, test_mutants, test_coarse_selection_types)
             temp_loader = DataLoader(temp_dataset, batch_size=BATCH_SIZE, gene_to_wt = gene_to_wt, shuffle=False, gene_aware=True, esm_embedding_loaders=esm_embedding_loaders, ohe_embedding_loaders=ohe_embedding_loaders)
@@ -2000,7 +2002,7 @@ def main():
                 batches = precompute_batches(gene_aware_test_loader, projection_net)
                 ohe_llr_baseline(batches, projection_net)
             else:
-                classification_comparison_by_train_size(projection_net, temp_loader, device, train_sizes=[.025, .05, .1, .2, .4, .6, .8, 1.0], num_bootstraps=args.num_bootstraps)
+                classification_comparison_by_train_size(projection_net, temp_loader, device, train_sizes=[.025, .05, .1, .2, .4, .6, .8, 1.0], num_bootstraps=args.num_bootstraps, selection_type=selection_type)
         
 
 
