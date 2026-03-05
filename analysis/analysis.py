@@ -1,4 +1,6 @@
 import pandas as pd
+import json
+from pathlib import Path
 
 """
 selection_types = ['Stability', 'Binding', 'Expression', 'OrganismalFitness', 'Activity']
@@ -45,6 +47,7 @@ for col in key_cols:
 
 """
 
+"""
 selection_types = ['Stability', 'Binding', 'Expression', 'OrganismalFitness', 'Activity']
 data_dir = "/gpfs/scratch/jv2807/dms_data/datasets"
 
@@ -58,3 +61,45 @@ all_selection_types = pd.concat(
 )
 print(all_selection_types.head())
 all_selection_types.to_csv(f"{data_dir}/all_selection_types.csv", index=False)
+"""
+
+selection_types = ['Stability', 'Binding', 'Expression', 'OrganismalFitness', 'Activity']
+results_dir = Path("/gpfs/home/jv2807/dms_contrastive/results")
+
+
+def avg_metrics(block):
+    spearman_values = []
+    p_values = []
+    for gene_metrics in block.values():
+        ridge = gene_metrics.get("ridge", {})
+        spearman_key = "spearman_r" if "spearman_r" in ridge else "sperman_r"
+        if spearman_key in ridge:
+            spearman_values.append(ridge[spearman_key])
+        if "p-value" in ridge:
+            p_values.append(ridge["p-value"])
+
+    avg_spearman = sum(spearman_values) / len(spearman_values) if spearman_values else float("nan")
+    avg_p = sum(p_values) / len(p_values) if p_values else float("nan")
+    return avg_spearman, avg_p
+
+
+print("selection_type\tbaseline_avg_spearman_r\tbaseline_avg_p_value\tprojection_avg_spearman_r\tprojection_avg_p_value")
+for selection in selection_types:
+    json_path = results_dir / f"esmc_spearmanr_{selection}" / "result_dicts" / "ohe_llr_metrics_1.json"
+    if not json_path.exists():
+        print(f"{selection}\tMISSING\tMISSING\tMISSING\tMISSING")
+        continue
+
+    with json_path.open() as f:
+        result_dict = json.load(f)
+
+    baseline_block = result_dict["baseline"]["positional_split"]
+    projection_block = result_dict["projections"]["positional_split"]
+
+    baseline_avg_r, baseline_avg_p = avg_metrics(baseline_block)
+    projection_avg_r, projection_avg_p = avg_metrics(projection_block)
+
+    print(
+        f"{selection}\t{baseline_avg_r:.10f}\t{baseline_avg_p:.12g}\t"
+        f"{projection_avg_r:.10f}\t{projection_avg_p:.12g}"
+    )

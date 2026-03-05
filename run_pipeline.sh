@@ -1,8 +1,8 @@
 #!/bin/bash
-#SBATCH -p gpu4_medium
+#SBATCH -p gpu4_short
 #SBATCH --gres=gpu:1
-#SBATCH --time=72:00:00
-#SBATCH --mem=30G
+#SBATCH --time=12:00:00
+#SBATCH --mem=20G
 #SBATCH --output=logs/%j.out
 #SBATCH --job-name=dms_cl_sp
 #SBATCH --signal=B:TERM@60
@@ -14,7 +14,7 @@ BASE_DATA_PATH="/gpfs/scratch/jv2807/dms_data"
 
 EMBEDDING_LAYER="layer33_mean"
 
-for COARSE_SELECTION_TYPE in "Stability" "OrganismalFitness" "Activity" "Expression" "Binding" ; do
+for COARSE_SELECTION_TYPE in "Binding" "OrganismalFitness" ; do
     echo "Running ${COARSE_SELECTION_TYPE} ${EMBEDDING_LAYER}"
 
     RUN_NAME="esmc_spearmanr_${COARSE_SELECTION_TYPE}"
@@ -27,9 +27,9 @@ for COARSE_SELECTION_TYPE in "Stability" "OrganismalFitness" "Activity" "Express
         --model_name esmc \
         --esm_max_length 600 \
         --input_dim 1152 \
-        --batch_size 4 \
+        --batch_size 64 \
         --gradient_accumulation_steps 8 \
-        --patience 4 \
+        --patience 2 \
         --eval_per_epoch 2 \
         --dropout 0.0 \
         --metadata_path $BASE_DATA_PATH/datasets/DMS_substitutions.csv \
@@ -43,12 +43,15 @@ for COARSE_SELECTION_TYPE in "Stability" "OrganismalFitness" "Activity" "Express
         --split_by_gene \
         --split_file /gpfs/home/jv2807/dms_contrastive/results/650M_splitbygene_lora2_${COARSE_SELECTION_TYPE}_layer33_mean/data_split.json \
         --ohe_baseline \
-        --eval_regression \
         --num_bootstraps 1 \
-        --model_path /gpfs/home/jv2807/dms_contrastive/results/600M_esmc_NWT_${COARSE_SELECTION_TYPE}/model.pt \
-        --selection_types ${COARSE_SELECTION_TYPE}
+        --eval_regression \
+        --selection_types ${COARSE_SELECTION_TYPE} \
+        --model_path /gpfs/home/jv2807/dms_contrastive/results/600M_esmc_NWT_${COARSE_SELECTION_TYPE}/model.pt
 
 done
+
+#         --model_path /gpfs/home/jv2807/dms_contrastive/results/600M_esmc_NWT_${COARSE_SELECTION_TYPE}/model.pt \
+
 
 #        --use_lora \
 #--model_name facebook/esm2_t33_650M_UR50D \
