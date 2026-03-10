@@ -104,6 +104,9 @@ def parse_args():
     parser.add_argument('--esm_lr', type=float, default=0.00005, 
                         help='Learning rate for ESM LoRA adapter')
     parser.add_argument('--esm_warmup', type=float, default=0.05)
+    
+    parser.add_argument('--subsample', type=float, default=None)
+    parser.add_argument('--dont_save_model', action='store_true')
 
     #wandb args
     parser.add_argument('--wandb_project', type=str, default='dms-contrastive', help='Weights and Biases project name')
@@ -1649,23 +1652,24 @@ def train(projection_net, loss_fn, train_loader, test_loader, optimizer, device)
                         best_optimizer_state = copy.deepcopy(optimizer.state_dict())
                         print(f" Step {global_step+1}: New best val auc: {best_val_auc:.4f}")
 
-                        torch.save({
-                            'model_state_dict': best_model_state,
-                            'optimizer_state_dict': best_optimizer_state,
-                            'esm_model_state_dict': best_esm_state if args.use_lora else None,
-                            'esm_model_optimizer_state_dict': best_esm_optimizer_state if args.use_lora else None,
-                            'train_losses': train_losses,
-                            'val_losses': val_losses,
-                            'global_step': global_step,
-                            'epoch': epoch,
-                            'config': {
-                                'distance_metric': DISTANCE_METRIC,
-                                'hidden_dims': HIDDEN_DIMS,
-                                'learning_rate': LEARNING_RATE,
-                                'best_val_auc': best_val_auc,
-                                'use_lora': args.use_lora,  # NEW
-                            }
-                        }, f'{RESULTS_DIR}/temp_model.pt')
+                        if not args.dont_save_model:
+                            torch.save({
+                                'model_state_dict': best_model_state,
+                                'optimizer_state_dict': best_optimizer_state,
+                                'esm_model_state_dict': best_esm_state if args.use_lora else None,
+                                'esm_model_optimizer_state_dict': best_esm_optimizer_state if args.use_lora else None,
+                                'train_losses': train_losses,
+                                'val_losses': val_losses,
+                                'global_step': global_step,
+                                'epoch': epoch,
+                                'config': {
+                                    'distance_metric': DISTANCE_METRIC,
+                                    'hidden_dims': HIDDEN_DIMS,
+                                    'learning_rate': LEARNING_RATE,
+                                    'best_val_auc': best_val_auc,
+                                    'use_lora': args.use_lora,  # NEW
+                                }
+                            }, f'{RESULTS_DIR}/temp_model.pt')
 
                     else:
                         patience_counter += 1
@@ -1697,28 +1701,29 @@ def train(projection_net, loss_fn, train_loader, test_loader, optimizer, device)
     print("TRAINING COMPLETE")
     print("="*80 + "\n")
 
-    print("\n=== Saving Model ===")
-    torch.save({
-        'model_state_dict': best_model_state,
-        'optimizer_state_dict': best_optimizer_state,
-        'esm_model_state_dict': best_esm_state if args.use_lora else None,
-        'train_losses': train_losses,
-        'val_losses': val_losses,
-        'config': {
-            'distance_metric': DISTANCE_METRIC,
-            'hidden_dims': HIDDEN_DIMS,
-            'learning_rate': LEARNING_RATE,
-            'best_val_auc': best_val_auc,
-            'use_lora': args.use_lora,  # NEW
-        }
-    }, f'{RESULTS_DIR}/model.pt')
-    print(f" Model saved to '{RESULTS_DIR}/model.pt'")
+    if not args.dont_save_model:
+        print("\n=== Saving Model ===")
+        torch.save({
+            'model_state_dict': best_model_state,
+            'optimizer_state_dict': best_optimizer_state,
+            'esm_model_state_dict': best_esm_state if args.use_lora else None,
+            'train_losses': train_losses,
+            'val_losses': val_losses,
+            'config': {
+                'distance_metric': DISTANCE_METRIC,
+                'hidden_dims': HIDDEN_DIMS,
+                'learning_rate': LEARNING_RATE,
+                'best_val_auc': best_val_auc,
+                'use_lora': args.use_lora,  # NEW
+            }
+        }, f'{RESULTS_DIR}/model.pt')
+        print(f" Model saved to '{RESULTS_DIR}/model.pt'")
     
-    # NEW: Save LoRA adapter separately
-    if args.use_lora and esm_model is not None:
-        lora_save_dir = f'{RESULTS_DIR}/esm_lora_adapter'
-        os.makedirs(lora_save_dir, exist_ok=True)
-        save_lora_adapter(esm_model, lora_save_dir)
+        # NEW: Save LoRA adapter separately
+        if args.use_lora and esm_model is not None:
+            lora_save_dir = f'{RESULTS_DIR}/esm_lora_adapter'
+            os.makedirs(lora_save_dir, exist_ok=True)
+            save_lora_adapter(esm_model, lora_save_dir)
 
     plot_training_metrics(train_losses, val_losses, train_aucs, val_aucs)
 
@@ -1750,6 +1755,8 @@ def main():
 
     #load and preprocess data
     df, original_length = load_and_preprocess_data(DATA_PATH)
+    if args.subsample:
+        df = df.sample(frac=args.subsample, random_state=42)
     print(f'Initial mutated sequence length distribution: {df["mutated_sequence"].str.len().describe()}')
     initial_length = len(df)
     df = df[df['mutated_sequence'].str.len() <= args.esm_max_length]

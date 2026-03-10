@@ -62,7 +62,7 @@ all_selection_types = pd.concat(
 print(all_selection_types.head())
 all_selection_types.to_csv(f"{data_dir}/all_selection_types.csv", index=False)
 """
-
+"""
 selection_types = ['Stability', 'Binding', 'Expression', 'OrganismalFitness', 'Activity']
 results_dir = Path("/gpfs/home/jv2807/dms_contrastive/results")
 
@@ -84,22 +84,67 @@ def avg_metrics(block):
 
 
 print("selection_type\tbaseline_avg_spearman_r\tbaseline_avg_p_value\tprojection_avg_spearman_r\tprojection_avg_p_value")
+#for selection in selection_types:
+json_path = '/gpfs/home/jv2807/dms_contrastive/results/all_selection_types_LORA_600M_esmc_NWT_eval_spearmanr/result_dicts/ohe_llr_metrics_1.json'#results_dir / f"esmc_spearmanr_{selection}" / "result_dicts" / "ohe_llr_metrics_1.json"
+#if not json_path.exists():
+#    print(f"{selection}\tMISSING\tMISSING\tMISSING\tMISSING")
+#    continue
+
+with open(json_path, 'r') as f:
+    result_dict = json.load(f)
+
+baseline_block = result_dict["baseline"]["positional_split"]
+projection_block = result_dict["projections"]["positional_split"]
+
+baseline_avg_r, baseline_avg_p = avg_metrics(baseline_block)
+projection_avg_r, projection_avg_p = avg_metrics(projection_block)
+
+print(
+    f"{'all'}\t{baseline_avg_r:.10f}\t{baseline_avg_p:.12g}\t"
+    f"{projection_avg_r:.10f}\t{projection_avg_p:.12g}"
+)
+"""
+"""
+Find genes shared across multiple selection types and save overlap details to JSON.
+"""
+selection_types = ['Stability', 'Binding', 'Expression', 'OrganismalFitness', 'Activity']
+data_dir = "/gpfs/scratch/jv2807/dms_data/datasets"
+
+gene_to_selection_types = {}
 for selection in selection_types:
-    json_path = results_dir / f"esmc_spearmanr_{selection}" / "result_dicts" / "ohe_llr_metrics_1.json"
-    if not json_path.exists():
-        print(f"{selection}\tMISSING\tMISSING\tMISSING\tMISSING")
-        continue
+    dataset_path = f"{data_dir}/{selection}.csv"
+    df = pd.read_csv(dataset_path, usecols=["uniprot_id"])
+    unique_genes = df["uniprot_id"].dropna().unique()
+    for gene in unique_genes:
+        gene_to_selection_types.setdefault(gene, set()).add(selection)
 
-    with json_path.open() as f:
-        result_dict = json.load(f)
+shared_genes = [
+    (gene, sorted(list(selections)))
+    for gene, selections in gene_to_selection_types.items()
+    if len(selections) > 1
+]
+shared_genes.sort(key=lambda x: (-len(x[1]), x[0]))
 
-    baseline_block = result_dict["baseline"]["positional_split"]
-    projection_block = result_dict["projections"]["positional_split"]
+print("\nGenes shared across multiple selection types:")
+for gene, selections in shared_genes:
+    print(f"{gene}\t{len(selections)}\t{selections}")
 
-    baseline_avg_r, baseline_avg_p = avg_metrics(baseline_block)
-    projection_avg_r, projection_avg_p = avg_metrics(projection_block)
+shared_gene_output = {
+    "selection_types": selection_types,
+    "data_dir": data_dir,
+    "num_shared_genes": len(shared_genes),
+    "shared_genes": [
+        {
+            "gene": gene,
+            "num_selection_types": len(selections),
+            "selection_types": selections,
+        }
+        for gene, selections in shared_genes
+    ],
+}
 
-    print(
-        f"{selection}\t{baseline_avg_r:.10f}\t{baseline_avg_p:.12g}\t"
-        f"{projection_avg_r:.10f}\t{projection_avg_p:.12g}"
-    )
+output_json_path = Path("/gpfs/home/jv2807/dms_contrastive/analysis/shared_genes_across_selection_types.json")
+with open(output_json_path, "w") as f:
+    json.dump(shared_gene_output, f, indent=2)
+
+print(f"\nSaved shared gene overlap info to: {output_json_path}")
