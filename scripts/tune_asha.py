@@ -38,7 +38,8 @@ BASE_CMD = [
     "--split_file", "/gpfs/home/jv2807/dms_contrastive/results/all_selection_types_600M_esmc_NWT/data_split.json",
     "--use_lora",
     "--dont_save_model",
-    "--subsample", "0.05"
+    "--subsample", "0.05",
+    "--h5_read_only"
 ]
 
 def trainable(config):

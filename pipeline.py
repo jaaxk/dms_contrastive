@@ -106,6 +106,7 @@ def parse_args():
     parser.add_argument('--esm_warmup', type=float, default=0.05)
     
     parser.add_argument('--subsample', type=float, default=None)
+    parser.add_argument('--h5_read_only', action='store_true', help='Open H5 embedding files in read-only mode and error if any embeddings are missing')
     parser.add_argument('--dont_save_model', action='store_true')
 
     #wandb args
@@ -307,6 +308,11 @@ def load_embeddings_h5(sequences, embedding_loader, embedding_type, mutants=None
     assert len(missing_seqs) == len(missing_indices)
     
     if len(missing_seqs) > 0:
+        if getattr(embedding_loader, "read_only", False):
+            raise RuntimeError(
+                f"Missing {len(missing_seqs)} embeddings while in H5 read-only mode. "
+                "Precompute embeddings or disable --h5_read_only."
+            )
         if embedding_type == 'esm':
             if args.use_lora:
                 print('WARNING: while finetuning, we should not be generating new embeddings from this function: this probably means we are missing pre-computed WT embeddings and they are being generated here with the current (finetuned) model, not the original ESM model')
@@ -1806,6 +1812,7 @@ def main():
             args.embeddings_path.replace('{selection_type}', selection_type),
             original_length*1.05,
             embed_dim=args.input_dim,
+            read_only=args.h5_read_only,
         )
         for selection_type in args.selection_types
     }
@@ -1819,6 +1826,7 @@ def main():
                 args.ohe_embeddings_path.replace('{selection_type}', selection_type),
                 original_length*1.05,
                 embed_dim=20*args.esm_max_length,
+                read_only=args.h5_read_only,
             )
             for selection_type in args.selection_types
         }

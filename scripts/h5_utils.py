@@ -10,7 +10,7 @@ import signal
 class EmbeddingLoader:
     
 
-    def __init__(self, embeddings_path, N, embed_dim=1280):
+    def __init__(self, embeddings_path, N, embed_dim=1280, read_only=False):
         print(f"Initializing h5 file at {embeddings_path}")
         self.hash_to_id_path = embeddings_path + '.hash_to_id.json'
         self.hash_to_id = {}
@@ -19,11 +19,14 @@ class EmbeddingLoader:
         self.embeddings_path = embeddings_path
         self.N = N
         self.embed_dim = embed_dim
+        self.read_only = read_only
 
         self._closed = False
         self._register_cleanup_handlers()
 
         if not os.path.exists(embeddings_path):
+            if self.read_only:
+                raise FileNotFoundError(f"H5 file not found (read-only mode): {embeddings_path}")
             os.makedirs(os.path.dirname(embeddings_path), exist_ok=True)
             self.h5_file = h5py.File(embeddings_path, "w")
             self.h5_file.create_dataset(
@@ -40,7 +43,8 @@ class EmbeddingLoader:
                     maxshape=(None,),
                 )
         else:
-            self.h5_file = h5py.File(embeddings_path, "r+")
+            mode = "r" if self.read_only else "r+"
+            self.h5_file = h5py.File(embeddings_path, mode)
 
         print(f'H5 stats for {embeddings_path}')
         print("shape:", self.h5_file['X'].shape)
@@ -188,4 +192,3 @@ class EmbeddingLoader:
     
     def close_h5(self):
         self._safe_close()
-
