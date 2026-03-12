@@ -6,11 +6,14 @@ from collections import deque
 from ray import tune
 from ray.air import session
 from ray.tune.schedulers import ASHAScheduler
+from ray.tune.search.optuna import OptunaSearch
 
 VAL_AUC_RE = re.compile(r"Val AUC:\s*([0-9]*\.?[0-9]+)")
 
 BASE_DATA_PATH="/gpfs/scratch/jv2807/dms_data"
 EMBEDDING_LAYER="layer33_mean"
+EVALS_PER_EPOCH = 4
+NUM_SAMPLES = 48
 
 # 1) Put your fixed args here (everything except LoRA HPs)
 BASE_CMD = [
@@ -23,9 +26,8 @@ BASE_CMD = [
     "--model_name", "esmc",
     "--esm_max_length", "600",
     "--batch_size", "4",
-    "--gradient_accumulation_steps", "8",
     "--patience", "999",
-    "--eval_per_epoch", "4",
+    "--eval_per_epoch", str(EVALS_PER_EPOCH),
     "--dropout", "0.0",
     "--metadata_path", BASE_DATA_PATH+"/datasets/DMS_substitutions.csv",
     "--num_epochs", "3",
@@ -51,20 +53,28 @@ def trainable(config):
     cmd[cmd.index("PLACEHOLDER")] = run_name
 
     # append sampled LoRA params
+    lora_target_modules = config["lora_target_modules"].split("|")
+    hidden_dims = config["hidden_dims"]
     cmd += [
         "--lora_rank", str(config["lora_rank"]),
         "--lora_alpha", str(config["lora_alpha"]),
         "--esm_lr", str(config["esm_lr"]),
         "--esm_warmup", str(config["esm_warmup"]),
-        "--lora_target_modules", *config["lora_target_modules"],
+        "--lora_target_modules", *lora_target_modules,
+        "--gradient_accumulation_steps", str(config["gradient_accumulation_steps"]),
+        "--dropout", str(config["dropout"]),
+        "--learning_rate", str(config["learning_rate"]),
+        "--hidden_dims", hidden_dims,
     ]
 
     env = os.environ.copy()
     # optional: pin one GPU per trial if needed
     # env["CUDA_VISIBLE_DEVICES"] = "0"
 
-    trial_dir = os.getcwd()
-    log_path = os.path.join(trial_dir, "pipeline.log")
+    orig_cwd = os.environ.get("TUNE_ORIG_WORKING_DIR", os.getcwd())
+    log_dir = os.path.join(orig_cwd, "logs")
+    os.makedirs(log_dir, exist_ok=True)
+    log_path = os.path.join(log_dir, f"{trial_id}.log")
     tail = deque(maxlen=80)
 
     with open(log_path, "w", buffering=1) as log_file:
@@ -76,7 +86,6 @@ def trainable(config):
         best_auc = float("-inf")
 
         for line in p.stdout:
-            print(line, end="")
             log_file.write(line)
             tail.append(line.rstrip())
             m = VAL_AUC_RE.search(line)
@@ -108,25 +117,37 @@ if __name__ == "__main__":
         "esm_lr": tune.loguniform(1e-6, 2e-4),
         "esm_warmup": tune.choice([0.0, 0.01, 0.03, 0.05]),
         "lora_target_modules": tune.choice([
-            ["layernorm_qkv.1", "out_proj"],
-            ["layernorm_qkv.1"],
+            "layernorm_qkv.1|out_proj",
+            "layernorm_qkv.1",
         ]),
+        "gradient_accumulation_steps": tune.choice([4, 8, 12]),
+        "dropout": tune.choice([0.0, 0.05, 0.1]),
+        "learning_rate": tune.loguniform(0.00001, 0.001),
+        "hidden_dims": tune.choice([
+            "512,256,128",
+            "512,256,64",
+            "512,256,256",
+            "512,256,32",
+        ])
     }
 
     scheduler = ASHAScheduler(
         metric="val_auc",
         mode="max",
         max_t=30,          # max reports (not epochs)
-        grace_period=4,    # minimum reports before pruning
+        grace_period=EVALS_PER_EPOCH,    # minimum reports before pruning
         reduction_factor=3
     )
+
+    search_alg = OptunaSearch(metric="val_auc", mode="max")
 
     tuner = tune.Tuner(
         tune.with_resources(trainable, resources={"cpu": 4, "gpu": 1}),
         param_space=search_space,
         tune_config=tune.TuneConfig(
             scheduler=scheduler,
-            num_samples=24
+            search_alg=search_alg,
+            num_samples=NUM_SAMPLES
         ),
     )
 

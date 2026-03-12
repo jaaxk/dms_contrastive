@@ -31,6 +31,7 @@ from transformers import AutoTokenizer, AutoModel, AutoModelForMaskedLM
 import scripts.h5_utils as h5_utils
 import json
 import re
+import ast
 from contextlib import redirect_stdout, redirect_stderr
 from scripts.metrics import contrastive_metrics, kmeans_metrics, logreg_metrics, knn_metrics, ridge_metrics, ridge_regression_metrics
 
@@ -58,7 +59,7 @@ def parse_args():
     parser.add_argument('--eval_batches_during_training', type=int, default=999999, help='Number of batches to evaluate on during training - set higher for more stable eval metrics but longer training time')
 
     #model hyperparams
-    parser.add_argument('--hidden_dims', type=list, default=[512, 256, 128])
+    parser.add_argument('--hidden_dims', type=str, default="512,256,128")
     parser.add_argument('--normalize_output', type=bool, default=True)
     parser.add_argument('--freeze_esm', action='store_true', default=False)
     parser.add_argument('--esm_layer', type=int, default=33)
@@ -120,6 +121,11 @@ def parse_args():
     return args
 
 args = parse_args()
+if isinstance(args.hidden_dims, str):
+    if args.hidden_dims.strip().startswith("["):
+        args.hidden_dims = [int(x) for x in ast.literal_eval(args.hidden_dims)]
+    else:
+        args.hidden_dims = [int(x) for x in args.hidden_dims.split(",") if x]
 
 #EMBEDDINGS_PATH = args.embeddings_path
 DATA_PATH = args.data_path
@@ -1640,6 +1646,13 @@ def train(projection_net, loss_fn, train_loader, test_loader, optimizer, device)
                         'global_step': global_step
                     })
 
+                    print("  Evaluation Results")
+                    print(f"  Global Step: {global_step}")
+                    print(f"  Train Loss: {total_loss / num_batches:.4f}") #, Train Acc: {train_acc:.4f}")
+                    print(f"  Val Loss: {val_loss:.4f}, Val Acc: {val_acc:.4f}")
+                    print(f"  Patience: {patience_counter}/{PATIENCE}")
+                    print(f"  Train AUC: {train_auc:.4f}, Val AUC: {val_auc:.4f}")
+
                     train_losses.append(total_loss / num_batches)
                     val_losses.append(val_loss)
                     train_accs.append(train_acc)
@@ -1684,10 +1697,10 @@ def train(projection_net, loss_fn, train_loader, test_loader, optimizer, device)
 
         #if (epoch + 1) % 5 == 0:
         print(f"Epoch {epoch+1}/{NUM_EPOCHS}")
-        print(f"  Train Loss: {total_loss / num_batches:.4f}") #, Train Acc: {train_acc:.4f}")
-        print(f"  Val Loss: {val_loss:.4f}, Val Acc: {val_acc:.4f}")
-        print(f"  Patience: {patience_counter}/{PATIENCE}")
-        print(f"  Train AUC: {train_auc:.4f}, Val AUC: {val_auc:.4f}")
+        #print(f"  Train Loss: {total_loss / num_batches:.4f}") #, Train Acc: {train_acc:.4f}")
+        #print(f"  Val Loss: {val_loss:.4f}, Val Acc: {val_acc:.4f}")
+        #print(f"  Patience: {patience_counter}/{PATIENCE}")
+        #print(f"  Train AUC: {train_auc:.4f}, Val AUC: {val_auc:.4f}")
 
         if USE_LEARNABLE:
             print(f"  Alpha: {loss_fn.alpha.item():.4f}, Beta: {loss_fn.beta.item():.4f}")

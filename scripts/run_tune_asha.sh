@@ -1,9 +1,9 @@
 #!/bin/bash
-#SBATCH -p gpu4_medium
-#SBATCH --gres=gpu:4
+#SBATCH -p gpu8_medium
+#SBATCH --gres=gpu:8
 #SBATCH --time=72:00:00
 #SBATCH --mem=150G
-#SBATCH --output=tune.log
+#SBATCH --output=logs/tune.log
 #SBATCH --job-name=tune
 #SBATCH --signal=B:TERM@60
 
