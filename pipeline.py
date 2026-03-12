@@ -82,7 +82,7 @@ def parse_args():
     parser.add_argument('--ohe_baseline', action='store_true', default=False)
     parser.add_argument('--num_bootstraps', type=int, default=20)
     parser.add_argument('--model_path', type=str, default=None, help='path to pre-trained PROJECTION HEAD')
-    parser.add_argument('--esm_variants_module_path', default='/gpfs/home/jv2807/dms_contrastive/esm-variants')
+    parser.add_argument('--esm_variants_module_path', default='/home/jv2807/dms_contrastive/esm-variants')
     parser.add_argument('--split_file', type=str, default=None, help='path to json file specifying train/test split')
     parser.add_argument('--set_seed', action='store_true', help='set random seed to 42 for reproducibility', default=False)
     parser.add_argument('--test_same_gene_batch', action='store_true', help='for evaluation only, whether to use a gene-aware test loader that creates batches of variants from the same gene, rather than random batches', default=False)
@@ -343,7 +343,7 @@ def load_embeddings_h5(sequences, embedding_loader, embedding_type, mutants=None
     return embeddings
 
 class DataLoader():
-    def __init__(self, dataset, batch_size=16, shuffle=True, balance_quartiles=True, gene_to_wt=None, gene_aware=False, esm_embedding_loaders=None, ohe_embedding_loaders=None):
+    def __init__(self, dataset, batch_size=16, shuffle=True, balance_quartiles=True, gene_to_wt=None, gene_aware=False, esm_embedding_loaders=None, ohe_embedding_loaders=None, drop_last=False):
         self.dataset = dataset
         self.batch_size = batch_size
         self.shuffle = shuffle
@@ -353,6 +353,7 @@ class DataLoader():
         self.load_ohe = False
         self.esm_embedding_loaders = esm_embedding_loaders
         self.ohe_embedding_loaders = ohe_embedding_loaders
+        self.drop_last = drop_last
 
         if self.gene_aware == False and self.shuffle==False:
             raise ValueError('If gene_aware is False, shuffle must be True - otherwise it is not truly different-gene batches')
@@ -404,6 +405,16 @@ class DataLoader():
 
                         batch = [self.dataset[idx] for idx in batch_indices]
                         all_batches.append(batch)
+
+                    if not self.drop_last:
+                        high_rem = high_indices[num_batches * half_batch:]
+                        low_rem = low_indices[num_batches * half_batch:]
+                        n_rem = min(len(high_rem), len(low_rem))
+                        if n_rem >= 1:  # at least 1 from each quartile → total >= 2
+                            rem_indices = list(high_rem[:n_rem]) + list(low_rem[:n_rem])
+                            if self.shuffle:
+                                np.random.shuffle(rem_indices)
+                            all_batches.append([self.dataset[idx] for idx in rem_indices])
 
             if self.shuffle:
                 np.random.shuffle(all_batches)
@@ -500,8 +511,13 @@ class DataLoader():
             for quartile_dict in self.gene_groups.values():
                 high = quartile_dict['high']
                 low = quartile_dict['low']
-                total_batches += min(len(high)//half_batch,
-                                    len(low)//half_batch)
+                n_full = min(len(high) // half_batch, len(low) // half_batch)
+                total_batches += n_full
+                if not self.drop_last:
+                    high_rem = len(high) - n_full * half_batch
+                    low_rem = len(low) - n_full * half_batch
+                    if min(high_rem, low_rem) >= 1:
+                        total_batches += 1
             return total_batches
         else:
             half_batch = self.batch_size // 2

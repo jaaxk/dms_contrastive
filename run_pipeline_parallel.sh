@@ -6,10 +6,9 @@
 #SBATCH --output=logs/%j_lora.out
 #SBATCH --job-name=dms_cl
 
-module load python/gpu/3.10.6-cuda12.9
-source venv/bin/activate
+SINGULARITY="singularity exec --nv --overlay /scratch/jv2807/dms_singularity/dms_contrastive.ext3:ro /share/apps/images/cuda12.1.1-cudnn8.9.0-devel-ubuntu22.04.2.sif"
 
-BASE_DATA_PATH="/gpfs/scratch/jv2807/dms_data"
+BASE_DATA_PATH="/scratch/jv2807/dms_data"
 EMBEDDING_LAYER="layer33_mean"
 
 SELECTION_TYPES=("Stability" "OrganismalFitness" "Binding")
@@ -21,11 +20,11 @@ for i in "${!SELECTION_TYPES[@]}"; do
     
     RUN_NAME="650M_esm2_lora_NWT_${COARSE_SELECTION_TYPE}_${EMBEDDING_LAYER}"
     
-    CUDA_VISIBLE_DEVICES=$i python -u pipeline.py --run_name $RUN_NAME \
+    CUDA_VISIBLE_DEVICES=$i $SINGULARITY /bin/bash -c "source /ext3/env.sh; cd /home/jv2807/dms_contrastive && CUDA_VISIBLE_DEVICES=$i python -u pipeline.py --run_name $RUN_NAME \
         --data_path $BASE_DATA_PATH/datasets/${COARSE_SELECTION_TYPE}.csv \
         --embeddings_path $BASE_DATA_PATH/embeddings/${COARSE_SELECTION_TYPE}/650M_t33_mean_layer33.h5 \
         --ohe_embeddings_path $BASE_DATA_PATH/embeddings/${COARSE_SELECTION_TYPE}/ohe_embeddings.h5 \
-        --model_cache /gpfs/scratch/jv2807/cache \
+        --model_cache /scratch/jv2807/cache \
         --model_name esm2 \
         --esm_max_length 600 \
         --batch_size 4 \
@@ -43,9 +42,9 @@ for i in "${!SELECTION_TYPES[@]}"; do
         --esm_lr .000005 \
         --lora_target_modules query key value \
         --split_by_gene \
-        --split_file /gpfs/home/jv2807/dms_contrastive/results/650M_splitbygene_lora2_${COARSE_SELECTION_TYPE}_layer33_mean/data_split.json \
+        --split_file /home/jv2807/dms_contrastive/results/650M_splitbygene_lora2_${COARSE_SELECTION_TYPE}_layer33_mean/data_split.json \
         --ohe_baseline \
-        > logs/${SLURM_JOB_ID}_${COARSE_SELECTION_TYPE}.out 2>&1 &
+        " > logs/${SLURM_JOB_ID}_${COARSE_SELECTION_TYPE}.out 2>&1 &
 done
 
 wait
