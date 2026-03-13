@@ -37,7 +37,19 @@ from scripts.metrics import contrastive_metrics, kmeans_metrics, logreg_metrics,
 
 warnings.filterwarnings('ignore')
 
-device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+import torch.distributed as dist
+from torch.nn.parallel import DistributedDataParallel as DDP
+
+LOCAL_RANK = int(os.environ.get('LOCAL_RANK', -1))
+WORLD_SIZE = int(os.environ.get('WORLD_SIZE', 1))
+IS_DDP = LOCAL_RANK != -1
+
+if IS_DDP:
+    dist.init_process_group(backend='nccl')
+    torch.cuda.set_device(LOCAL_RANK)
+    device = torch.device(f'cuda:{LOCAL_RANK}')
+else:
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 print(f"Using device: {device}")
 
 def parse_args():
@@ -156,13 +168,18 @@ if args.model_path is None:
     else:
         print("No pre-trained model found")
        
-os.makedirs(RESULTS_DIR, exist_ok=True)
-json.dump(vars(args), open(f'{RESULTS_DIR}/args.json', 'w'))
-os.makedirs(f'{RESULTS_DIR}/training_figs', exist_ok=True)
-RESULTS_FILE = f'{args.base_results_dir}/results.csv'
-if not os.path.exists(RESULTS_FILE):
-    with open(RESULTS_FILE, 'w') as f:
-        f.write('run_name,test_loss,test_acc,test_precision,test_recall,test_f1,test_auc\n')
+if not IS_DDP or LOCAL_RANK == 0:
+    os.makedirs(RESULTS_DIR, exist_ok=True)
+    json.dump(vars(args), open(f'{RESULTS_DIR}/args.json', 'w'))
+    os.makedirs(f'{RESULTS_DIR}/training_figs', exist_ok=True)
+    RESULTS_FILE = f'{args.base_results_dir}/results.csv'
+    if not os.path.exists(RESULTS_FILE):
+        with open(RESULTS_FILE, 'w') as f:
+            f.write('run_name,test_loss,test_acc,test_precision,test_recall,test_f1,test_auc\n')
+else:
+    RESULTS_FILE = f'{args.base_results_dir}/results.csv'
+if IS_DDP:
+    dist.barrier()  # all ranks wait until rank-0 has created dirs/files
 
 if args.normalize_to_wt:
     if not args.metadata_path:
@@ -343,7 +360,7 @@ def load_embeddings_h5(sequences, embedding_loader, embedding_type, mutants=None
     return embeddings
 
 class DataLoader():
-    def __init__(self, dataset, batch_size=16, shuffle=True, balance_quartiles=True, gene_to_wt=None, gene_aware=False, esm_embedding_loaders=None, ohe_embedding_loaders=None, drop_last=False):
+    def __init__(self, dataset, batch_size=16, shuffle=True, balance_quartiles=True, gene_to_wt=None, gene_aware=False, esm_embedding_loaders=None, ohe_embedding_loaders=None, drop_last=False, rank=0, world_size=1):
         self.dataset = dataset
         self.batch_size = batch_size
         self.shuffle = shuffle
@@ -354,6 +371,8 @@ class DataLoader():
         self.esm_embedding_loaders = esm_embedding_loaders
         self.ohe_embedding_loaders = ohe_embedding_loaders
         self.drop_last = drop_last
+        self.rank = rank
+        self.world_size = world_size
 
         if self.gene_aware == False and self.shuffle==False:
             raise ValueError('If gene_aware is False, shuffle must be True - otherwise it is not truly different-gene batches')
@@ -419,6 +438,10 @@ class DataLoader():
             if self.shuffle:
                 np.random.shuffle(all_batches)
 
+            # DDP: each rank processes its round-robin slice of gene-batches
+            if self.world_size > 1:
+                all_batches = all_batches[self.rank::self.world_size]
+
             for batch in all_batches:
                 yield self._collate_batch(batch)
 
@@ -434,18 +457,25 @@ class DataLoader():
             # Determine the number of batches we can make
             half_batch = self.batch_size // 2
             num_batches = min(len(high_indices), len(low_indices)) // half_batch
-            
+
+            all_batches = []
             for i in range(num_batches):
                 # Take equal number of high and low quartile samples
                 batch_high = high_indices[i*half_batch:(i+1)*half_batch]
                 batch_low = low_indices[i*half_batch:(i+1)*half_batch]
                 batch_indices = batch_high + batch_low
-                
+
                 # Shuffle the combined batch
                 if self.shuffle:
                     np.random.shuffle(batch_indices)
-                    
-                batch = [self.dataset[idx] for idx in batch_indices]
+
+                all_batches.append([self.dataset[idx] for idx in batch_indices])
+
+            # DDP: each rank processes its round-robin slice of batches
+            if self.world_size > 1:
+                all_batches = all_batches[self.rank::self.world_size]
+
+            for batch in all_batches:
                 yield self._collate_batch(batch)
 
     def _collate_batch(self, batch):
@@ -518,12 +548,12 @@ class DataLoader():
                     low_rem = len(low) - n_full * half_batch
                     if min(high_rem, low_rem) >= 1:
                         total_batches += 1
-            return total_batches
         else:
             half_batch = self.batch_size // 2
             high = [i for i,q in enumerate(self.dataset.quartiles) if q=='high']
             low = [i for i,q in enumerate(self.dataset.quartiles) if q=='low']
-            return min(len(high), len(low)) // half_batch
+            total_batches = min(len(high), len(low)) // half_batch
+        return math.ceil(total_batches / self.world_size)
 
 class ContrastiveNetwork(nn.Module):
     def __init__(self, input_dim=1280, hidden_dims=[512, 256, 128], normalize_output=False, esm_layer=33, esm_only=False, normalize_to_wt=False):
@@ -898,7 +928,7 @@ def evaluate_model(projection_net, loss_fn, dataloader, device):
     num_batches = 0
 
     with torch.no_grad():
-        for i, batch in enumerate(tqdm(dataloader, desc="Evaluation")):
+        for i, batch in enumerate(tqdm(dataloader, desc="Evaluation", disable=IS_DDP and LOCAL_RANK != 0)):
             quartiles = batch['quartiles']
 
             #project embeddings
@@ -1529,7 +1559,7 @@ def train(projection_net, loss_fn, train_loader, test_loader, optimizer, device)
     from transformers import get_cosine_schedule_with_warmup
     import wandb
     import copy
-    run = wandb.init(project=args.wandb_project, name=RUN_NAME, entity=args.wandb_entity, config=args.__dict__)
+    run = wandb.init(project=args.wandb_project, name=RUN_NAME, entity=args.wandb_entity, config=args.__dict__) if (not IS_DDP or LOCAL_RANK == 0) else None
     
     train_losses = []
     val_losses = []
@@ -1547,15 +1577,18 @@ def train(projection_net, loss_fn, train_loader, test_loader, optimizer, device)
 
     esm_optimizer = None
     if args.use_lora and esm_model is not None:
-        esm_optimizer = optim.Adam(esm_model.parameters(), lr=args.esm_lr)
+        esm_optimizer = optim.Adam(
+            (esm_model.module if IS_DDP else esm_model).parameters(), lr=args.esm_lr
+        )
         print(f"ESM LoRA optimizer initialized with lr={args.esm_lr}")
     
     print(f"\n{'='*80}")
     print("STARTING TRAINING")
     print(f"{'='*80}\n")
 
-    print(f'Batches: {len(train_loader)}')
-    print(f'Effective batch size (after gradient accumulation): {train_loader.batch_size * args.gradient_accumulation_steps}')
+    print(f'Batches per rank: {len(train_loader)}')
+    print(f'Effective batch size (per rank, after gradient accumulation): {train_loader.batch_size * args.gradient_accumulation_steps}')
+    print(f'Global effective batch size (all ranks): {train_loader.batch_size * args.gradient_accumulation_steps * WORLD_SIZE}')
     effective_batches = math.floor(len(train_loader) / args.gradient_accumulation_steps)
 
     if args.eval_per_epoch is not None:
@@ -1599,7 +1632,7 @@ def train(projection_net, loss_fn, train_loader, test_loader, optimizer, device)
         train_quartiles = []
         num_batches = 0
 
-        for batch_idx, batch in enumerate(tqdm(train_loader, desc="Training")):
+        for batch_idx, batch in enumerate(tqdm(train_loader, desc="Training", disable=IS_DDP and LOCAL_RANK != 0)):
             projection_net.train()
             if batch_idx % args.gradient_accumulation_steps == 0:
                 optimizer.zero_grad()
@@ -1639,75 +1672,116 @@ def train(projection_net, loss_fn, train_loader, test_loader, optimizer, device)
 
                 if (global_step) % args.eval_steps == 0:
                     #eval
+                    if IS_DDP:
+                        dist.barrier()  # sync all ranks before eval
                     val_loss, val_similarities, val_labels_epoch, val_dists, val_quartiles, val_projections = evaluate_model(
                         projection_net, loss_fn, test_loader, device
                     )
 
-                    val_acc, val_precision, val_recall, val_f1 = contrastive_metrics(val_similarities, val_labels_epoch)
-                    train_acc, train_precision, train_recall, train_f1 = contrastive_metrics(train_similarities, train_labels)
-                    train_auc = roc_auc_score(train_labels, train_similarities)
-                    val_auc = roc_auc_score(val_labels_epoch, val_similarities)
-                    #ridge_acc, ridge_precision, ridge_recall, ridge_f1, ridge_auc = ridge_metrics(train_projections, train_quartiles, val_projections, val_quartiles) #would have to split val projections by position
-
-                    #wandb log
-                    wandb.log({
-                        'avg_train_loss': total_loss / num_batches,
-                        'avg_val_loss': val_loss,
-                        'train_similarity_acc': train_acc,
-                        'val_similarity_acc': val_acc,
-                        'train_similarity_auc': train_auc,
-                        'val_similarity_auc': val_auc,
-                        'epoch': epoch + 1,
-                        'patience_counter': patience_counter,
-                        'global_step': global_step
-                    })
-
-                    print("  Evaluation Results")
-                    print(f"  Global Step: {global_step}")
-                    print(f"  Train Loss: {total_loss / num_batches:.4f}") #, Train Acc: {train_acc:.4f}")
-                    print(f"  Val Loss: {val_loss:.4f}, Val Acc: {val_acc:.4f}")
-                    print(f"  Patience: {patience_counter}/{PATIENCE}")
-                    print(f"  Train AUC: {train_auc:.4f}, Val AUC: {val_auc:.4f}")
-
-                    train_losses.append(total_loss / num_batches)
-                    val_losses.append(val_loss)
-                    train_accs.append(train_acc)
-                    val_accs.append(val_acc)
-                    train_aucs.append(train_auc)
-                    val_aucs.append(val_auc)
-
-                    if val_auc > best_val_auc:
-                        best_val_auc = val_auc
-                        patience_counter = 0
-                        best_model_state = copy.deepcopy(projection_net.state_dict())
-                        if args.use_lora and esm_model is not None:
-                            best_esm_state = copy.deepcopy(esm_model.state_dict())
-                            best_esm_optimizer_state = copy.deepcopy(esm_optimizer.state_dict())
-
-                        best_optimizer_state = copy.deepcopy(optimizer.state_dict())
-                        print(f" Step {global_step+1}: New best val auc: {best_val_auc:.4f}")
-
-                        if not args.dont_save_model:
-                            torch.save({
-                                'model_state_dict': best_model_state,
-                                'optimizer_state_dict': best_optimizer_state,
-                                'esm_model_state_dict': best_esm_state if args.use_lora else None,
-                                'esm_model_optimizer_state_dict': best_esm_optimizer_state if args.use_lora else None,
-                                'train_losses': train_losses,
-                                'val_losses': val_losses,
-                                'global_step': global_step,
-                                'epoch': epoch,
-                                'config': {
-                                    'distance_metric': DISTANCE_METRIC,
-                                    'hidden_dims': HIDDEN_DIMS,
-                                    'learning_rate': LEARNING_RATE,
-                                    'best_val_auc': best_val_auc,
-                                    'use_lora': args.use_lora,  # NEW
-                                }
-                            }, f'{RESULTS_DIR}/temp_model.pt')
-
+                    # DDP: gather eval and train results from all ranks to rank-0
+                    if IS_DDP:
+                        gathered = {}
+                        for key, lst in [
+                            ('val_sims', val_similarities), ('val_labels', val_labels_epoch),
+                            ('val_dists', val_dists), ('val_quarts', val_quartiles),
+                            ('val_projs', val_projections),
+                            ('train_sims', train_similarities), ('train_labels', train_labels),
+                        ]:
+                            buf = [None] * WORLD_SIZE
+                            dist.all_gather_object(buf, lst)
+                            gathered[key] = buf
+                        if LOCAL_RANK == 0:
+                            val_similarities  = [x for sub in gathered['val_sims']    for x in sub]
+                            val_labels_epoch  = [x for sub in gathered['val_labels']  for x in sub]
+                            val_dists         = [x for sub in gathered['val_dists']   for x in sub]
+                            val_quartiles     = [x for sub in gathered['val_quarts']  for x in sub]
+                            val_projections   = [x for sub in gathered['val_projs']   for x in sub]
+                            eff_train_sims    = [x for sub in gathered['train_sims']  for x in sub]
+                            eff_train_labels  = [x for sub in gathered['train_labels'] for x in sub]
+                        else:
+                            eff_train_sims   = train_similarities
+                            eff_train_labels = train_labels
                     else:
-                        patience_counter += 1
+                        eff_train_sims   = train_similarities
+                        eff_train_labels = train_labels
+
+                    if not IS_DDP or LOCAL_RANK == 0:
+                        val_acc, val_precision, val_recall, val_f1 = contrastive_metrics(val_similarities, val_labels_epoch)
+                        train_acc, train_precision, train_recall, train_f1 = contrastive_metrics(eff_train_sims, eff_train_labels)
+                        train_auc = roc_auc_score(eff_train_labels, eff_train_sims)
+                        val_auc = roc_auc_score(val_labels_epoch, val_similarities)
+                        #ridge_acc, ridge_precision, ridge_recall, ridge_f1, ridge_auc = ridge_metrics(train_projections, train_quartiles, val_projections, val_quartiles) #would have to split val projections by position
+
+                        #wandb log
+                        if run is not None:
+                            wandb.log({
+                                'avg_train_loss': total_loss / num_batches,
+                                'avg_val_loss': val_loss,
+                                'train_similarity_acc': train_acc,
+                                'val_similarity_acc': val_acc,
+                                'train_similarity_auc': train_auc,
+                                'val_similarity_auc': val_auc,
+                                'epoch': epoch + 1,
+                                'patience_counter': patience_counter,
+                                'global_step': global_step
+                            })
+
+                        print("  Evaluation Results")
+                        print(f"  Global Step: {global_step}")
+                        print(f"  Train Loss: {total_loss / num_batches:.4f}") #, Train Acc: {train_acc:.4f}")
+                        print(f"  Val Loss: {val_loss:.4f}, Val Acc: {val_acc:.4f}")
+                        print(f"  Patience: {patience_counter}/{PATIENCE}")
+                        print(f"  Train AUC: {train_auc:.4f}, Val AUC: {val_auc:.4f}")
+
+                        train_losses.append(total_loss / num_batches)
+                        val_losses.append(val_loss)
+                        train_accs.append(train_acc)
+                        val_accs.append(val_acc)
+                        train_aucs.append(train_auc)
+                        val_aucs.append(val_auc)
+
+                        if val_auc > best_val_auc:
+                            best_val_auc = val_auc
+                            patience_counter = 0
+                            best_model_state = copy.deepcopy(
+                                (projection_net.module if IS_DDP else projection_net).state_dict()
+                            )
+                            if args.use_lora and esm_model is not None:
+                                best_esm_state = copy.deepcopy(
+                                    (esm_model.module if IS_DDP else esm_model).state_dict()
+                                )
+                                best_esm_optimizer_state = copy.deepcopy(esm_optimizer.state_dict())
+
+                            best_optimizer_state = copy.deepcopy(optimizer.state_dict())
+                            print(f" Step {global_step+1}: New best val auc: {best_val_auc:.4f}")
+
+                            if not args.dont_save_model:
+                                torch.save({
+                                    'model_state_dict': best_model_state,
+                                    'optimizer_state_dict': best_optimizer_state,
+                                    'esm_model_state_dict': best_esm_state if args.use_lora else None,
+                                    'esm_model_optimizer_state_dict': best_esm_optimizer_state if args.use_lora else None,
+                                    'train_losses': train_losses,
+                                    'val_losses': val_losses,
+                                    'global_step': global_step,
+                                    'epoch': epoch,
+                                    'config': {
+                                        'distance_metric': DISTANCE_METRIC,
+                                        'hidden_dims': HIDDEN_DIMS,
+                                        'learning_rate': LEARNING_RATE,
+                                        'best_val_auc': best_val_auc,
+                                        'use_lora': args.use_lora,
+                                    }
+                                }, f'{RESULTS_DIR}/temp_model.pt')
+
+                        else:
+                            patience_counter += 1
+
+                    # DDP: broadcast patience_counter from rank-0 so early stopping is consistent across ranks
+                    if IS_DDP:
+                        patience_tensor = torch.tensor(patience_counter, device=device)
+                        dist.broadcast(patience_tensor, src=0)
+                        patience_counter = patience_tensor.item()
 
                     
 
@@ -1721,7 +1795,7 @@ def train(projection_net, loss_fn, train_loader, test_loader, optimizer, device)
         if USE_LEARNABLE:
             print(f"  Alpha: {loss_fn.alpha.item():.4f}, Beta: {loss_fn.beta.item():.4f}")
 
-        if (epoch + 1) % 20 == 0:
+        if (epoch + 1) % 20 == 0 and (not IS_DDP or LOCAL_RANK == 0):
             print("\n=== Distance Clustering Analysis ===")
             similar_mean, dissimilar_mean, separation = plot_distance_clustering(
                 train_dists, train_labels_epoch, f"Training - Epoch {epoch+1}", final=False
@@ -1736,7 +1810,7 @@ def train(projection_net, loss_fn, train_loader, test_loader, optimizer, device)
     print("TRAINING COMPLETE")
     print("="*80 + "\n")
 
-    if not args.dont_save_model:
+    if not args.dont_save_model and (not IS_DDP or LOCAL_RANK == 0):
         print("\n=== Saving Model ===")
         torch.save({
             'model_state_dict': best_model_state,
@@ -1749,18 +1823,19 @@ def train(projection_net, loss_fn, train_loader, test_loader, optimizer, device)
                 'hidden_dims': HIDDEN_DIMS,
                 'learning_rate': LEARNING_RATE,
                 'best_val_auc': best_val_auc,
-                'use_lora': args.use_lora,  # NEW
+                'use_lora': args.use_lora,
             }
         }, f'{RESULTS_DIR}/model.pt')
         print(f" Model saved to '{RESULTS_DIR}/model.pt'")
-    
-        # NEW: Save LoRA adapter separately
+
+        # Save LoRA adapter separately
         if args.use_lora and esm_model is not None:
             lora_save_dir = f'{RESULTS_DIR}/esm_lora_adapter'
             os.makedirs(lora_save_dir, exist_ok=True)
-            save_lora_adapter(esm_model, lora_save_dir)
+            save_lora_adapter(esm_model.module if IS_DDP else esm_model, lora_save_dir)
 
-    plot_training_metrics(train_losses, val_losses, train_aucs, val_aucs)
+    if not IS_DDP or LOCAL_RANK == 0:
+        plot_training_metrics(train_losses, val_losses, train_aucs, val_aucs)
 
     return best_model_state, best_esm_state
 
@@ -1831,6 +1906,9 @@ def main():
     print(f'train seq length distribution: {pd.Series(train_seqs).str.len().describe()}')
     print(f'test seq length distribution: {pd.Series(test_seqs).str.len().describe()}')
 
+    if IS_DDP:
+        args.h5_read_only = True  # embeddings always pre-computed; prevent concurrent H5 writes
+
     #init h5 files for embeddings
     if args.embeddings_path is None:
         raise ValueError("Embeddings path must be specified")
@@ -1873,17 +1951,18 @@ def main():
                                          test_genes, test_mutants, test_coarse_selection_types)
 
     #create data loaders
+    ddp_kwargs = dict(rank=LOCAL_RANK if IS_DDP else 0, world_size=WORLD_SIZE)
     if args.train_same_gene_batch:
-        train_loader = DataLoader(train_dataset, batch_size=BATCH_SIZE, gene_to_wt = gene_to_wt, shuffle=True, gene_aware=True, esm_embedding_loaders=esm_embedding_loaders, ohe_embedding_loaders=ohe_embedding_loaders)
+        train_loader = DataLoader(train_dataset, batch_size=BATCH_SIZE, gene_to_wt = gene_to_wt, shuffle=True, gene_aware=True, esm_embedding_loaders=esm_embedding_loaders, ohe_embedding_loaders=ohe_embedding_loaders, **ddp_kwargs)
     elif args.train_different_gene_batch:
-        train_loader = DataLoader(train_dataset, batch_size=BATCH_SIZE, gene_to_wt = gene_to_wt, shuffle=True, gene_aware=False, esm_embedding_loaders=esm_embedding_loaders, ohe_embedding_loaders=ohe_embedding_loaders)
+        train_loader = DataLoader(train_dataset, batch_size=BATCH_SIZE, gene_to_wt = gene_to_wt, shuffle=True, gene_aware=False, esm_embedding_loaders=esm_embedding_loaders, ohe_embedding_loaders=ohe_embedding_loaders, **ddp_kwargs)
     else:
         raise ValueError("Must specify either --train_same_gene_batch or --train_different_gene_batch")
 
     if args.test_same_gene_batch:
-        test_loader = DataLoader(test_dataset, batch_size=BATCH_SIZE, gene_to_wt = gene_to_wt, shuffle=False, gene_aware=True, esm_embedding_loaders=esm_embedding_loaders, ohe_embedding_loaders=ohe_embedding_loaders)
+        test_loader = DataLoader(test_dataset, batch_size=BATCH_SIZE, gene_to_wt = gene_to_wt, shuffle=False, gene_aware=True, esm_embedding_loaders=esm_embedding_loaders, ohe_embedding_loaders=ohe_embedding_loaders, **ddp_kwargs)
     elif args.test_different_gene_batch:
-        test_loader = DataLoader(test_dataset, batch_size=BATCH_SIZE, gene_to_wt = gene_to_wt, shuffle=True, gene_aware=False, esm_embedding_loaders=esm_embedding_loaders, ohe_embedding_loaders=ohe_embedding_loaders)
+        test_loader = DataLoader(test_dataset, batch_size=BATCH_SIZE, gene_to_wt = gene_to_wt, shuffle=True, gene_aware=False, esm_embedding_loaders=esm_embedding_loaders, ohe_embedding_loaders=ohe_embedding_loaders, **ddp_kwargs)
     else:
         raise ValueError("Must specify either --test_same_gene_batch or --test_different_gene_batch")
 
@@ -1913,12 +1992,23 @@ def main():
         normalize_to_wt=args.normalize_to_wt
     ).to(device)
 
+    if IS_DDP:
+        projection_net = DDP(projection_net, device_ids=[LOCAL_RANK],
+                             gradient_as_bucket_view=True)
+        if args.use_lora:
+            esm_model = DDP(esm_model, device_ids=[LOCAL_RANK],
+                            gradient_as_bucket_view=True,
+                            find_unused_parameters=True)  # LoRA freezes most ESM params
+
     loss_fn = ContrastiveLoss(
         distance_metric=DISTANCE_METRIC,
         use_learnable=USE_LEARNABLE
     )
 
-    optimizer = optim.Adam(projection_net.parameters(), lr=LEARNING_RATE)
+    optimizer = optim.Adam(
+        (projection_net.module if IS_DDP else projection_net).parameters(),
+        lr=LEARNING_RATE
+    )
 
     print(f"\n Model initialized")
     print(f"   Parameters: {sum(p.numel() for p in projection_net.parameters()):,}")
@@ -2016,7 +2106,7 @@ def main():
             f.write(f'{RUN_NAME}_contrastive,-,{val_acc},{val_precision},{val_recall},{val_f1},{val_auc}\n')
         """
 
-    if args.ohe_baseline:
+    if args.ohe_baseline and (not IS_DDP or LOCAL_RANK == 0):
         print("\n=== BASELINE vs PROJECTION EVALUATION ===")
         #llr_threshold_performance(gene_aware_test_loader)
         #ohe_llr_baseline(loss_fn, gene_aware_test_loader)
@@ -2084,6 +2174,9 @@ def main():
     if ohe_embedding_loaders is not None:
         for loader in ohe_embedding_loaders.values():
             loader.close_h5()
+
+    if IS_DDP:
+        dist.destroy_process_group()
 
 if __name__ == '__main__':
     main()
